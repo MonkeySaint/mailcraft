@@ -281,6 +281,7 @@ pub(crate) fn kind_label(k: AccountKind) -> &'static str {
         AccountKind::Imap => "IMAP/SMTP",
         AccountKind::Jmap => "JMAP",
         AccountKind::Exchange => "Exchange",
+        AccountKind::Graph => "Microsoft 365 (Graph)",
     }
 }
 
@@ -733,6 +734,23 @@ impl Extra {
     }
 }
 
+/// What a Microsoft Graph account's settings page says (in place of the provider's IMAP/POP/SMTP hints):
+/// `provider` is the lookup's provider id.
+fn graph_notes(provider: &str) -> Vec<String> {
+    let mut v = vec![
+        "Microsoft Graph reads and sends this mailbox over HTTPS: IMAP, POP and SMTP do not have to be turned on."
+            .to_owned(),
+        "The app you registered needs the Microsoft Graph permissions Mail.ReadWrite, Mail.Send and offline_access."
+            .to_owned(),
+    ];
+    if provider == "microsoft365" {
+        v.push(
+            "An administrator of your organization may need to consent to those permissions once.".to_owned(),
+        );
+    }
+    v
+}
+
 #[derive(Clone, Default)]
 struct Wizard {
     page: u8,
@@ -743,6 +761,8 @@ struct Wizard {
     finished: bool,
     manual: bool,
     jmap: bool,
+    /// A Microsoft 365 / Outlook.com mailbox through Microsoft Graph (OAuth sign-in, no SMTP).
+    graph: bool,
     /// Incoming mail over POP3.
     pop3: bool,
     extra: Extra,
@@ -805,7 +825,11 @@ impl Wizard {
     /// RFC 8620 well-known JMAP session URL; the address as user name.
     fn guess(&mut self) {
         let domain = self.domain();
-        if self.jmap {
+        if self.graph {
+            mailcraft_engine::accounts::GRAPH_BASE.clone_into(&mut self.in_host);
+            // Graph takes no password: the sign-in is the OAuth section's.
+            self.extra.oauth_open = true;
+        } else if self.jmap {
             self.in_host = format!("https://{domain}/.well-known/jmap");
         } else {
             self.in_host = if self.pop3 { format!("pop.{domain}") } else { format!("imap.{domain}") };
@@ -842,15 +866,21 @@ impl Wizard {
         } else {
             "imap"
         };
-        // The lookup found nothing for this account type: the guess stands, without the provider's hints.
-        let Some(inc) = d.get(incoming).filter(|v| v.is_object()) else { return };
+        // The lookup found nothing for this account type: the guess stands, without the provider's hints. (A
+        // Graph account needs a provider Graph serves.)
+        let graph_provider = provider.filter(|p| p.get("graph").and_then(Value::as_bool) == Some(true));
+        let inc = if self.graph { graph_provider } else { d.get(incoming).filter(|v| v.is_object()) };
+        let Some(inc) = inc else { return };
         let preselect = std::mem::take(&mut self.oauth_preselect);
         if let Some(p) = provider {
-            self.provider_notes = p
-                .get("notes")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
-                .unwrap_or_default();
+            self.provider_notes = if self.graph {
+                graph_notes(p.get("id").and_then(Value::as_str).unwrap_or_default())
+            } else {
+                p.get("notes")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                    .unwrap_or_default()
+            };
             self.oauth_hint = p.get("oauthProvider").and_then(Value::as_str).map(str::to_owned);
             self.tenant = d.get("tenant").and_then(Value::as_str).map(str::to_owned);
             // The well-known providers sign in with OAuth (Microsoft only so): the section opens with the
@@ -875,7 +905,9 @@ impl Wizard {
                 unverified.push(host.to_owned());
             }
         };
-        if self.jmap {
+        if self.graph {
+            // The global endpoint (set by `guess`); the sign-in is the OAuth section's.
+        } else if self.jmap {
             let Some(url) = inc.get("url").and_then(Value::as_str) else { return };
             self.in_host = url.to_owned();
             note(inc, url);
@@ -946,13 +978,18 @@ impl Wizard {
         }
     }
 
-    /// The account type to start with when the lookup found something: IMAP, else POP, else JMAP. (When a
-    /// Microsoft Graph account kind exists (graph-mail, issue #4), it is the one to offer where the lookup's
-    /// `provider.graph` is true: Microsoft 365 and Outlook.com.)
+    /// The account type to start with when the lookup found something: Microsoft Graph for a provider Graph
+    /// serves (Microsoft 365 and Outlook.com: the lookup's `provider.graph`), else IMAP, else POP, else JMAP.
     fn kind_from_discovery(&mut self) {
         let has = |k: &str| self.discovered.as_ref().is_some_and(|d| d.get(k).is_some_and(Value::is_object));
         self.jmap = false;
         self.pop3 = false;
+        self.graph = self.discovered.as_ref().is_some_and(|d| {
+            d.get("provider").and_then(|p| p.get("graph")).and_then(Value::as_bool) == Some(true)
+        });
+        if self.graph {
+            return;
+        }
         if !has("imap") {
             if has("pop3") {
                 self.pop3 = true;
@@ -979,7 +1016,9 @@ impl Wizard {
     }
 
     fn kind_name(&self) -> &'static str {
-        if self.jmap {
+        if self.graph {
+            "Microsoft 365"
+        } else if self.jmap {
             "JMAP"
         } else if self.pop3 {
             "POP"
@@ -992,6 +1031,7 @@ impl Wizard {
     /// is saved.
     fn fill_from(&mut self, app: &App, a: &Account) {
         self.jmap = a.kind == AccountKind::Jmap;
+        self.graph = a.kind == AccountKind::Graph;
         self.pop3 = mailcraft_engine::accounts::kind_label(&app.s, a) == "pop3";
         self.extra = Extra::from_options(&mailcraft_engine::accounts::account_options(&app.s, a.id));
         self.extra.fill_dav(a.dav.as_ref());
@@ -1026,9 +1066,9 @@ impl Wizard {
         }
     }
 
-    /// A server is set to encryption None (JMAP: an `http:` session URL).
+    /// A server is set to encryption None (JMAP and Graph: an `http:` URL).
     fn unencrypted(&self) -> bool {
-        if self.jmap {
+        if self.jmap || self.graph {
             return self.in_host.trim().to_ascii_lowercase().starts_with("http:");
         }
         security_name(self.in_sec) == "none" || security_name(self.out_sec) == "none"
@@ -1037,7 +1077,7 @@ impl Wizard {
     fn settings_ok(&self) -> bool {
         self.address_ok()
             && !self.in_host.trim().is_empty()
-            && (self.jmap || !self.out_host.trim().is_empty())
+            && (self.jmap || self.graph || !self.out_host.trim().is_empty())
             && (self.change.is_some()
                 || self.created.is_some()
                 || !self.password.is_empty()
@@ -1065,7 +1105,7 @@ impl Wizard {
         } else {
             o.insert("push".into(), json!(e.push));
         }
-        if !self.pop3 && !self.jmap {
+        if !self.pop3 && !self.jmap && !self.graph {
             o.insert("keepOffline".into(), json!(e.keep_offline));
             let window = OfflineWindow::from_index(e.offline_window).unwrap_or_default();
             o.insert("offlineWindow".into(), json!(window.key()));
@@ -1077,7 +1117,7 @@ impl Wizard {
     fn params(&self, account: Option<u32>) -> Value {
         let user = if self.in_user.trim().is_empty() { self.address.trim() } else { self.in_user.trim() };
         let mut p = json!({
-            "kind": if self.jmap { "jmap" } else if self.pop3 { "pop3" } else { "imap" },
+            "kind": if self.graph { "graph" } else if self.jmap { "jmap" } else if self.pop3 { "pop3" } else { "imap" },
             "address": self.address.trim(),
             "senderName": self.name.trim(),
             "incoming": {
@@ -1086,14 +1126,14 @@ impl Wizard {
                 "security": security_name(self.in_sec),
                 "username": user,
                 "allowPlaintextAuth": self.allow_plain
-                    && if self.jmap { self.unencrypted() } else { security_name(self.in_sec) == "none" },
+                    && if self.jmap || self.graph { self.unencrypted() } else { security_name(self.in_sec) == "none" },
             },
         });
         let Some(o) = p.as_object_mut() else { return p };
         if !self.account_name.trim().is_empty() {
             o.insert("displayName".into(), json!(self.account_name.trim()));
         }
-        if !self.jmap {
+        if !self.jmap && !self.graph {
             let out_user = if self.out_separate && !self.out_user.trim().is_empty() {
                 self.out_user.trim()
             } else {
@@ -1291,29 +1331,39 @@ fn page_type(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
     heading(ui, app, "Advanced setup");
     ui.label(format!("Choose the account type for {}:", st.address.trim()));
     ui.add_space(6.0);
-    let mut pick: Option<(bool, bool)> = None;
+    let mut pick: Option<(bool, bool, bool)> = None;
     ui.horizontal(|ui| {
-        for (jmap, pop3, label, desc) in [
-            (false, false, "IMAP", "Reads mail with IMAP and sends it with SMTP (most providers)."),
+        for (jmap, pop3, graph, label, desc) in [
+            (false, false, false, "IMAP", "Reads mail with IMAP and sends it with SMTP (most providers)."),
             (
                 false,
                 true,
+                false,
                 "POP",
                 "Downloads mail with POP3 and sends it with SMTP; folders stay on this computer.",
             ),
-            (true, false, "JMAP", "One JSON-over-HTTPS server for reading and sending (RFC 8620/8621)."),
+            (true, false, false, "JMAP", "One JSON-over-HTTPS server for reading and sending (RFC 8620/8621)."),
+            (
+                false,
+                false,
+                true,
+                "Microsoft 365",
+                "A Microsoft 365 or Outlook.com mailbox through Microsoft Graph, signed in with your Microsoft \
+                 account (OAuth): mail, folders, flags and categories, with sending through the same mailbox.",
+            ),
         ] {
             let r = ui
                 .add_sized([120.0, 60.0], egui::Button::new(RichText::new(label).size(16.0)))
                 .on_hover_text(desc);
             if r.clicked() {
-                pick = Some((jmap, pop3));
+                pick = Some((jmap, pop3, graph));
             }
         }
     });
-    if let Some((jmap, pop3)) = pick {
+    if let Some((jmap, pop3, graph)) = pick {
         st.jmap = jmap;
         st.pop3 = pop3;
+        st.graph = graph;
         st.guess();
         st.page = PAGE_SETTINGS;
     }
@@ -1376,8 +1426,26 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
                 grid_edit(ui, "Your name:", &mut st.name, "", false);
             });
         }
-        common::heading(ui, app, if st.jmap { "Server" } else { "Incoming mail" });
+        common::heading(ui, app, if st.jmap || st.graph { "Server" } else { "Incoming mail" });
+        if st.graph {
+            muted(
+                ui,
+                app,
+                "Microsoft Graph reads and sends this mailbox's mail over HTTPS. Sign in with your Microsoft \
+                 account below (Sign in with OAuth 2.0): Graph takes no password.",
+            );
+        }
         egui::Grid::new(("mc-wiz-in", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            if st.graph {
+                grid_edit(
+                    ui,
+                    "Graph endpoint:",
+                    &mut st.in_host,
+                    mailcraft_engine::accounts::GRAPH_BASE,
+                    false,
+                );
+                return;
+            }
             if st.jmap {
                 grid_edit(ui, "Session URL:", &mut st.in_host, "https://example.com/.well-known/jmap", false);
             } else {
@@ -1398,7 +1466,7 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
             };
             grid_edit(ui, "Password:", &mut st.password, hint, true);
         });
-        if !st.jmap {
+        if !st.jmap && !st.graph {
             common::heading(ui, app, "Outgoing mail (SMTP)");
             egui::Grid::new(("mc-wiz-out", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 grid_edit(ui, "Outgoing server:", &mut st.out_host, "smtp.example.com", false);
@@ -1417,7 +1485,7 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
                 });
             }
         }
-        if !st.pop3 && !st.jmap {
+        if !st.pop3 && !st.jmap && !st.graph {
             offline_settings(ui, app, st);
         }
         more_settings(ui, app, st, uid);
@@ -1952,8 +2020,11 @@ fn test_rows(
     r: Option<&TestReport>,
     error: &str,
 ) -> Vec<(String, &'static str, String)> {
-    let jmap = acct.is_some_and(|a| a.kind == AccountKind::Jmap);
-    let incoming = if jmap {
+    let graph = acct.is_some_and(|a| a.kind == AccountKind::Graph);
+    let jmap = graph || acct.is_some_and(|a| a.kind == AccountKind::Jmap);
+    let incoming = if graph {
+        "Sign in to Microsoft Graph".to_owned()
+    } else if jmap {
         "Sign in to the JMAP server".to_owned()
     } else {
         "Log onto incoming mail server (IMAP)".to_owned()
@@ -2252,6 +2323,41 @@ mod tests {
         }));
         after_lookup(&mut w);
         assert!(!w.probable && w.found_in.contains("(MX) records"));
+    }
+
+    #[test]
+    fn microsoft_addresses_start_as_graph_accounts() {
+        let mut w = wizard("kim@m365.example.com");
+        w.take_discovery(json!({
+            "found": true, "sources": ["mx"], "tenant": "6f1a5c2e-0b7d-4c3a-9e8f-1d2c3b4a5e6f",
+            "imap": server("outlook.office365.com", 993, "tls", true, true),
+            "smtp": server("smtp.office365.com", 587, "starttls", true, true),
+            "provider": {"id": "microsoft365", "name": "Microsoft 365", "detectedBy": "mx",
+                         "oauthProvider": "microsoft", "graph": true, "notes": []},
+        }));
+        after_lookup(&mut w);
+        assert!(w.graph && !w.jmap && !w.pop3);
+        assert_eq!(w.in_host, "https://graph.microsoft.com/v1.0");
+        assert!(w.extra.oauth_open && w.extra.provider == 0, "signed in with the Microsoft provider");
+        assert_eq!(w.tenant.as_deref(), Some("6f1a5c2e-0b7d-4c3a-9e8f-1d2c3b4a5e6f"));
+        assert!(w.found_in.contains("(MX) records"), "{}", w.found_in);
+        assert!(w.settings_ok(), "no password needed");
+        let p = w.params(None);
+        assert_eq!(p["kind"], "graph");
+        assert!(p.get("outgoing").is_none(), "{p}");
+        assert!(p.get("keepOffline").is_none(), "{p}");
+        // The user picks IMAP instead: the provider's IMAP settings.
+        w.graph = false;
+        w.guess();
+        assert_eq!(w.in_host, "outlook.office365.com");
+        // Not a Graph provider: IMAP as before.
+        let mut w = wizard("kim@example.org");
+        w.take_discovery(json!({"found": true, "sources": ["autoconfig"],
+            "imap": server("imap.example.org", 993, "tls", true, false),
+            "smtp": server("smtp.example.org", 465, "tls", true, false)}));
+        after_lookup(&mut w);
+        assert!(!w.graph);
+        assert_eq!(w.in_host, "imap.example.org");
     }
 
     #[test]

@@ -2,6 +2,13 @@
 
 What changed in each MailCraft release. Help › What's New shows the newest entries from this file.
 
+## Unreleased
+
+- Microsoft 365 and Outlook.com accounts through Microsoft Graph: sign in with your Microsoft account; the
+  folder tree, mail (kept up to date with delta queries), read state, flags, categories, importance, moves,
+  deletions and folder changes both ways; sending with large attachments; throttling handled. Account setup
+  offers it for Microsoft 365 and Outlook.com addresses.
+
 ## 0.4.0
 
 - Large mailboxes: message bodies and sources are read from disk when shown instead of being kept in memory,

@@ -10,7 +10,7 @@ use rustls::ServerConfig;
 
 use crate::conn::Conn;
 use crate::store::Shared;
-use crate::{Config, Result, dav, dns, imap, jmap, pop3, smtp, web};
+use crate::{Config, Result, dav, dns, graph, imap, jmap, pop3, smtp, web};
 
 /// Maximum simultaneous connections per listener.
 const MAX_CONNECTIONS: usize = 256;
@@ -37,6 +37,8 @@ pub struct Ctx {
     pub dns: dns::Zone,
     /// WebDAV collections (contacts, calendars, tasks, published files).
     pub dav: dav::SharedDav,
+    /// The fake Microsoft Graph mail service's own state (`graph.rs`).
+    pub graph: graph::SharedGraph,
 }
 
 pub struct Running {
@@ -91,6 +93,7 @@ impl Running {
             web: Default::default(),
             dns: Default::default(),
             dav: Default::default(),
+            graph: Default::default(),
         });
         let conn_threads: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
         let mut accept_threads = Vec::new();

@@ -596,6 +596,51 @@ pub struct JmapState {
     pub folders: BTreeMap<String, JmapFolderShadow>,
 }
 
+/// What the client last knew of a Microsoft Graph message (to find local changes): its folder, read state,
+/// flag (`notFlagged` / `flagged` / `complete`) with its start and due day, categories and importance.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GraphShadow {
+    pub folder: String,
+    pub read: bool,
+    pub flag: String,
+    /// A flagged message's start (`YYYY-MM-DDTHH:MM:SS` in UTC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    /// A flagged message's due date (`YYYY-MM-DDTHH:MM:SS` in UTC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
+    pub categories: Vec<String>,
+    pub importance: String,
+}
+
+/// What the client last knew of a Graph mail folder that is not a default folder: its name as shown here
+/// and its parent folder (`None`: top level).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GraphFolderShadow {
+    pub name: String,
+    pub parent: Option<String>,
+}
+
+/// Microsoft Graph bookkeeping of one account.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GraphState {
+    /// Message id → what the client last knew of it.
+    pub shadow: BTreeMap<String, GraphShadow>,
+    /// Folder id → what the client last knew of it (folders without a role).
+    pub folders: BTreeMap<String, GraphFolderShadow>,
+    /// Folder id → the delta link its next update continues from.
+    pub delta: BTreeMap<String, String>,
+    /// Folders whose delta link is not moved on this run: a message listed there could not be stored here
+    /// (so the next run lists it again).
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub hold: BTreeSet<String>,
+    /// The folder list was read at least once.
+    pub listed: bool,
+}
+
 /// Everything in [`ACCOUNT_OPTIONS_FILE`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -610,6 +655,8 @@ pub struct AccountPrefs {
     pub marked: BTreeMap<u64, bool>,
     pub pop3: BTreeMap<u32, Pop3State>,
     pub jmap: BTreeMap<u32, JmapState>,
+    /// Microsoft Graph accounts' delta links and shadows (`sync/graph.rs`).
+    pub graph: BTreeMap<u32, GraphState>,
     /// User-defined Send/Receive groups (`sync/groups.rs`).
     pub groups: Vec<crate::sync::groups::SendReceiveGroup>,
 }
@@ -661,6 +708,7 @@ pub(crate) fn load_prefs(s: &mut Session) {
     d.accounts.retain(|k, _| ids.contains(k));
     d.pop3.retain(|k, _| ids.contains(k));
     d.jmap.retain(|k, _| ids.contains(k));
+    d.graph.retain(|k, _| ids.contains(k));
     d.groups.truncate(crate::sync::groups::MAX_GROUPS);
     for g in &mut d.groups {
         g.members.retain(|m| ids.contains(&m.account));
@@ -718,8 +766,10 @@ pub fn kind_label(s: &Session, a: &Account) -> &'static str {
 /// Drops the options and bookkeeping of a removed account.
 pub(crate) fn forget_options(s: &mut Session, id: AccountId) {
     let p = prefs(s);
-    let mut had =
-        p.accounts.remove(&id.0).is_some() | p.pop3.remove(&id.0).is_some() | p.jmap.remove(&id.0).is_some();
+    let mut had = p.accounts.remove(&id.0).is_some()
+        | p.pop3.remove(&id.0).is_some()
+        | p.jmap.remove(&id.0).is_some()
+        | p.graph.remove(&id.0).is_some();
     for g in &mut p.groups {
         let n = g.members.len();
         g.members.retain(|m| m.account != id.0);
@@ -880,7 +930,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.add",
             "Add Account",
-            r#"{"kind": "imap"|"jmap", "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string, "password"?: string (a DAV password of its own; empty removes it), "extraRootPem"?: string, "allowPlaintextAuth"?: bool}|null} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL)"#,
+            r#"{"kind": "imap"|"pop3"|"jmap"|"graph", "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string, "password"?: string (a DAV password of its own; empty removes it), "extraRootPem"?: string, "allowPlaintextAuth"?: bool}|null} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL; graph = Microsoft 365 / Outlook.com through Microsoft Graph: incoming optional, its host the API base, default https://graph.microsoft.com/v1.0, no outgoing; sign in with accounts.oauthSignIn, provider microsoft)"#,
             true,
             always,
             add,
@@ -1033,6 +1083,7 @@ pub(crate) fn kind_name(k: AccountKind) -> &'static str {
         AccountKind::Imap => "imap",
         AccountKind::Jmap => "jmap",
         AccountKind::Exchange => "exchange",
+        AccountKind::Graph => "graph",
     }
 }
 
@@ -1393,8 +1444,11 @@ fn parse_kind(p: &Value) -> Result<(AccountKind, bool), CmdError> {
         Some("imap") => Ok((AccountKind::Imap, false)),
         Some("pop3" | "pop") => Ok((AccountKind::Imap, true)),
         Some("jmap") => Ok((AccountKind::Jmap, false)),
-        Some(other) => Err(CmdError::Params(format!("unknown account kind `{other}` (imap, pop3 or jmap)"))),
-        None => Err(CmdError::Params("`kind` (\"imap\", \"pop3\" or \"jmap\") required".into())),
+        Some("graph" | "microsoft365" | "microsoft-graph") => Ok((AccountKind::Graph, false)),
+        Some(other) => {
+            Err(CmdError::Params(format!("unknown account kind `{other}` (imap, pop3, jmap or graph)")))
+        }
+        None => Err(CmdError::Params("`kind` (\"imap\", \"pop3\", \"jmap\" or \"graph\") required".into())),
     }
 }
 
@@ -1459,10 +1513,19 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         Some(n) => clean_line("your name", n)?,
         None => String::new(),
     };
-    let incoming_v =
-        field(p, &["incoming"]).ok_or_else(|| CmdError::Params("`incoming` server required".into()))?;
+    // A Graph account needs no server name: the global Microsoft Graph endpoint unless told otherwise.
+    let graph_default = json!({ "host": GRAPH_BASE });
+    let incoming_v = match field(p, &["incoming"]) {
+        Some(v) => v,
+        None if kind == AccountKind::Graph => &graph_default,
+        None => return Err(CmdError::Params("`incoming` server required".into())),
+    };
     let incoming = parse_server(incoming_v, kind, false, pop3, &address, None)?;
+    if kind == AccountKind::Graph && !graph_url_ok(&incoming) {
+        return Err(CmdError::Params(GRAPH_URL_NEEDED.into()));
+    }
     let outgoing = match field(p, &["outgoing"]) {
+        Some(_) if kind == AccountKind::Graph => return Err(CmdError::Params(GRAPH_NO_OUTGOING.into())),
         Some(v) => Some(parse_server(v, kind, true, false, &address, None)?),
         None => None,
     };
@@ -1499,6 +1562,7 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     // Options of an earlier account with the same id are gone with it.
     prefs(s).pop3.remove(&id.0);
     prefs(s).jmap.remove(&id.0);
+    prefs(s).graph.remove(&id.0);
     update_options(s, id, |o| *o = opts);
     store_secrets(s, id, secret_in, secret_out)?;
     store_dav_password(s, id, dav_password)?;
@@ -1506,6 +1570,19 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     Ok(
         json!({"account": id.0, "name": display_name, "address": address, "default": make_default, "kind": if pop3 { "pop3" } else { kind_name(kind) }}),
     )
+}
+
+/// The Microsoft Graph v1.0 endpoint new Graph accounts use.
+pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
+const GRAPH_URL_NEEDED: &str = "a Microsoft Graph account's `incoming.host` must be the API's https URL (https://graph.microsoft.com/v1.0)";
+const GRAPH_NO_OUTGOING: &str = "a Microsoft Graph account sends through Graph: it has no `outgoing` server";
+
+/// A Graph account's API base is an https URL (http only for a server the user explicitly trusts, such as a
+/// local test server).
+fn graph_url_ok(srv: &ServerSettings) -> bool {
+    let h = srv.host.trim().to_ascii_lowercase();
+    (h.starts_with("https://") || (h.starts_with("http://") && srv.allow_plaintext_auth))
+        && !h.contains(char::is_whitespace)
 }
 
 fn edit(s: &mut Session, p: &Value) -> CmdResult {
@@ -1534,9 +1611,15 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     load_prefs(s);
     let pop3 = is_pop3(s, id);
     if let Some(v) = field(p, &["incoming"]) {
-        a.incoming = Some(parse_server(v, a.kind, false, pop3, &a.address, old.incoming.as_ref())?);
+        let inc = parse_server(v, a.kind, false, pop3, &a.address, old.incoming.as_ref())?;
+        if a.kind == AccountKind::Graph && !graph_url_ok(&inc) {
+            return Err(CmdError::Params(GRAPH_URL_NEEDED.into()));
+        }
+        a.incoming = Some(inc);
     }
     match p.get("outgoing") {
+        Some(Value::Null) | None if a.kind == AccountKind::Graph => {}
+        Some(_) if a.kind == AccountKind::Graph => return Err(CmdError::Params(GRAPH_NO_OUTGOING.into())),
         Some(Value::Null) => a.outgoing = None,
         Some(v) => {
             a.outgoing = Some(parse_server(v, a.kind, true, false, &a.address, old.outgoing.as_ref())?)
@@ -1591,6 +1674,7 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     if reset {
         prefs(s).pop3.remove(&id.0);
         prefs(s).jmap.remove(&id.0);
+        prefs(s).graph.remove(&id.0);
     }
     if dav_reset {
         forget_dav(s, id);
@@ -1907,7 +1991,10 @@ fn oauth_sign_in(s: &mut Session, p: &Value) -> CmdResult {
     if a.kind == AccountKind::Local {
         return Err(CmdError::Disabled("a data file has no mail server".into()));
     }
-    let binding = oauth_binding(p)?;
+    let mut binding = oauth_binding(p)?;
+    if a.kind == AccountKind::Graph {
+        graph_scopes(&mut binding);
+    }
     let client_secret = match str_field(p, &["clientSecret", "client_secret"])? {
         Some(t) if !t.trim().is_empty() => Some(clean_line("the client secret", t)?),
         _ => None,
@@ -1939,6 +2026,18 @@ fn oauth_sign_in(s: &mut Session, p: &Value) -> CmdResult {
     update_options(s, id, |o| o.oauth = Some(binding.clone()));
     let state = crate::sync::start_oauth(s, id, &a.address, flow == "device").map_err(CmdError::Failed)?;
     Ok(state)
+}
+
+/// A Graph account signs in for Microsoft Graph's delegated permissions instead of the mail protocols' (one
+/// token serves one resource): the Microsoft provider gets `mailcraft_net::graph::MAIL_SCOPES` in place of its
+/// IMAP/POP/SMTP scopes; a custom provider without scopes gets them too.
+fn graph_scopes(b: &mut OAuthBinding) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if b.provider == "microsoft" || (b.provider == "custom" && b.scopes.is_empty()) {
+        b.scopes = mailcraft_net::graph::scopes(&[]);
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = b;
 }
 
 fn oauth_status(s: &mut Session, p: &Value) -> CmdResult {

@@ -27,7 +27,11 @@ Notes on the listed providers (from their public documentation):
 - Google: the device flow does not allow the Gmail scope, so only the browser flow is offered. Google issues a
   client secret to desktop applications; it is entered by the user like the client id.
 - Microsoft: both flows work with the `common` tenant (or the organization's own tenant, which account setup
-  finds from the domain); `offline_access` is needed for refresh tokens.
+  finds from the domain); `offline_access` is needed for refresh tokens. A **Microsoft 365 (Graph)** account
+  signs in with the same provider but asks for Microsoft Graph's delegated scopes instead of the scopes listed
+  in `oauth-providers.json` (`mailcraft_net::graph::MAIL_SCOPES`): `https://graph.microsoft.com/Mail.ReadWrite`,
+  `https://graph.microsoft.com/Mail.Send` and `offline_access`. One access token serves one resource, so a
+  Graph account's token never signs in to IMAP or SMTP, and the other way round.
 
 ## Registering a client id, step by step
 
@@ -65,7 +69,10 @@ it as one:
    is registered, so `http://localhost` alone is not enough.
 3. Authentication › **Allow public client flows: Yes** (needed for the device code flow).
 4. API permissions: `IMAP.AccessAsUser.All`, `POP.AccessAsUser.All`, `SMTP.Send` (Office 365 Exchange
-   Online) and `offline_access`. No client secret is needed.
+   Online) and `offline_access` for IMAP, POP and SMTP accounts; for **Microsoft 365 (Graph)** accounts,
+   Microsoft Graph › Delegated permissions › `Mail.ReadWrite`, `Mail.Send` and `offline_access` (calendars,
+   contacts and tasks over Graph add their own). One registration can carry both sets. No client secret is
+   needed.
 5. Supported account types: a registration for your own organization only (*single tenant*) is fine. Account
    setup finds the organization's tenant id from its domain and signs in at
    `https://login.microsoftonline.com/<tenant>/…` instead of `common` (`"tenant"` in `accounts.oauthSignIn`).
@@ -92,7 +99,8 @@ Endpoints must be `https`. The IMAP, POP3 and SMTP servers must offer `AUTH=XOAU
 ## Trying it without a real provider
 
 `mailcraft-testmail` runs a local authorization server (`TestServers::oauth_endpoints`, client id
-`mailcraft-test-client`) whose access tokens sign in to its IMAP, SMTP and JMAP servers. Tests approve a
+`mailcraft-test-client`) whose access tokens sign in to its IMAP, SMTP and JMAP servers and its fake
+Microsoft Graph mail service. Tests approve a
 device code with `TestServers::oauth_approve` (standing in for the person at the verification page) and can
 expire every access token at once to exercise refreshing. See `crates/net/tests/accounts_testmail.rs` and
 `crates/engine/tests/e2e_setup.rs`.

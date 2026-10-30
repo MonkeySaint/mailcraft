@@ -1,7 +1,8 @@
 # Mail accounts
 
-MailCraft talks to mail servers over open protocols only: IMAP and POP3 for incoming mail, SMTP for sending,
-and JMAP for both. Exchange (EWS) is not supported. Accounts are added with **File › Add Account** (or
+MailCraft talks to mail servers over open protocols: IMAP and POP3 for incoming mail, SMTP for sending, and
+JMAP for both; Microsoft 365 and Outlook.com mailboxes can also be reached through Microsoft Graph's public REST
+API. Exchange (EWS) is not supported. Accounts are added with **File › Add Account** (or
 `accounts.add`); try them against the local test servers (`mailcraft-testmail`) rather than a real mailbox.
 
 ## Finding the server settings
@@ -41,8 +42,10 @@ A well-known provider's settings page says how it was recognised and what may ne
 365 refuses passwords for IMAP, POP and SMTP (sign in with OAuth), the organization may have to turn on IMAP
 (or POP) and **Authenticated SMTP** for the mailbox, and an administrator may have to consent to the app's
 permissions. The OAuth section opens with the right provider chosen; for Microsoft 365 the sign-in goes to the
-organization's tenant, which single-tenant app registrations need. (A Microsoft Graph account kind, when there
-is one, is the alternative for Microsoft 365 and Outlook.com addresses: the lookup reports `provider.graph`.)
+organization's tenant, which single-tenant app registrations need. For Microsoft 365 and Outlook.com
+addresses (the lookup reports `provider.graph`) the wizard starts with the **Microsoft 365** account type
+(Microsoft Graph, see below); with **Let me set up my account manually** the Advanced setup page offers IMAP
+and POP with the provider's settings instead.
 
 The lookup runs in the background while the wizard says so (**Skip** stops waiting). The settings page then
 says where the settings came from; servers found in DNS outside the address's domain are pointed out and
@@ -152,6 +155,62 @@ Page Up / Page Down (three stops) and Home / End, and screen readers get its val
   `pollMinutes`.
 - Limits today: no header-only mode, and a message in several mailboxes shows in one folder.
 
+## Microsoft 365 and Outlook.com (Microsoft Graph)
+
+A **Microsoft 365** account (`accounts.add {"kind": "graph", "address": …}`) reads and sends a Microsoft 365 or
+Outlook.com mailbox through the Microsoft Graph REST API v1.0 (`https://graph.microsoft.com/v1.0`, the
+`incoming.host` of the account; another endpoint, such as a national cloud's, can be set there). It has no
+SMTP server and takes no password: sign in with **Sign in with OAuth 2.0**, provider **Microsoft**. For a
+Graph account the sign-in asks for Graph's delegated permissions instead of the IMAP/POP/SMTP ones (one token
+serves one service).
+
+**Permissions to grant** in the Microsoft Entra app registration (API permissions › Microsoft Graph ›
+Delegated): `Mail.ReadWrite` (read and change mail and folders), `Mail.Send` (send as the user) and
+`offline_access` (a refresh token). Calendars, contacts and tasks over Graph add their own permissions. An
+organization that does not let users consent to apps needs an administrator's consent once. IMAP, POP and
+Authenticated SMTP do not have to be turned on for the mailbox.
+
+- **Folders.** The whole folder tree with child folders. Graph's well-known folders (Inbox, Drafts, Sent
+  Items, Deleted Items, Junk Email, Archive) are the default folders; Graph's own Outbox stays out (MailCraft
+  keeps its own). Folders made, renamed, moved or deleted here are made, renamed, moved or deleted there; a
+  new folder is created before mail is moved into it. A folder made below a default folder the service does
+  not have (Conversation History, RSS Feeds) stays on this computer; mail moved into it keeps its copy on the
+  service where it was. A folder disappears here only when the service's whole folder list was read: a
+  cancelled update, or a list cut short at 5,000 folders or 32 levels, removes nothing.
+- **Mail.** Each folder is read with a delta query: the first one takes the mail of the download window
+  (`downloadMonths`), page by page, and the `deltaLink` it ends with is kept, so later updates only bring what
+  changed (new mail, read state, flags, categories, importance, moves, deletions). A delta state the service
+  no longer knows starts that folder over. New messages arrive with their MIME source (`$value`); with a
+  headers-first download preference only their header (built from the message's properties) arrives, and
+  the rest is downloaded when the message is opened, marked for download, or by **Download Headers and Then
+  Full Items** in the same run. A message moved on the service keeps its item here (immutable ids), also when
+  only the Inbox is updated (the poll, or one folder's Send/Receive): the service is asked where a message
+  that left the folder went, and only one it no longer has is removed here. A message that could not be
+  stored here (a full disk) is listed again by the next update.
+- **Changes made here** go back with the next run, or right after the command: read and unread, the
+  follow-up flag (with its start and due date, also when only the dates change) and completion, categories,
+  importance, moves between folders, and permanent deletion. Mail moved or copied in from elsewhere is
+  uploaded with its state; the service files uploads as drafts, but they stay ordinary mail here. When a
+  large file of an upload (or of a large message being sent) cannot go up, the message is deleted from the
+  service again and tried once more on the next run.
+- **Sending.** Outbox messages are sent with `sendMail` as MIME content (Bcc recipients included), and the
+  service files the copy in Sent Items, which the next update brings back. A message too large for one request
+  is made as a draft without its large attachments, which then go up in pieces through an upload session,
+  and the draft is sent.
+- **Throttling.** When the service answers 429 (or 503/504 for requests that can be repeated) the run waits
+  as its `Retry-After` asks (at most two minutes at a time, five times per request) and carries on.
+- **Focused Inbox.** New mail keeps the service's Focused / Other classification; Always Move to Focused /
+  Other still wins.
+- **Push.** Graph notifies only public web endpoints, so a Graph account with push on has its Inbox polled
+  every `pollMinutes` instead (**Polling**).
+- Limits today: no server search (Include Older Results), no offline window, uploaded messages are drafts on
+  the service, and Save Sent Item To has no effect (the service files the copy in Sent Items).
+
+The local test servers include a fake Graph mail service (`TestServers::graph_url`) on the same mail as their
+IMAP, POP3 and JMAP servers, with paging, delta links, `$value`, `sendMail`, upload sessions, flag dates, and
+throttling or refused upload sessions on demand; `crates/engine/tests/e2e_graph.rs` runs a Graph account against it end to end, and never against a
+Microsoft service.
+
 ## Download headers only
 
 **Send / Receive › Download Headers** fetches only the headers of new mail for that run.
@@ -248,7 +307,7 @@ providers' public endpoints and scopes, but **no client id**: register a desktop
 application with the provider and enter its client id in **Sign in with OAuth 2.0**. Both the device-code
 flow and the browser flow (PKCE with a one-time 127.0.0.1 redirect) are supported, and tokens are refreshed
 before they expire, and again when a server turns a token down (IMAP, POP3 and SMTP sign-in with XOAUTH2 or
-OAUTHBEARER, JMAP with a Bearer token). Step-by-step instructions for registering a client id are in
+OAUTHBEARER, JMAP and Microsoft Graph with a Bearer token). Step-by-step instructions for registering a client id are in
 [crates/net/data/README.md](../crates/net/data/README.md).
 
 The local test servers include an OAuth authorization server (device grant, authorization code with PKCE,

@@ -16,6 +16,9 @@
 //!    (RFC 2919 / RFC 2369), `Precedence: bulk | list | junk`, `Auto-Submitted: auto-generated` (RFC 3834),
 //!    or a sender address that says it takes no replies ("noreply", "no-reply", "donotreply"…).
 //! 6. Everything else is Focused.
+//!
+//! Mail of a Microsoft Graph account arrives classified by the service (its Focused Inbox,
+//! `inferenceClassification`); only the sender overrides (1) change that here.
 
 use std::collections::BTreeSet;
 
@@ -184,11 +187,26 @@ pub fn on_new_mail(s: &mut Session, ids: &[ItemId]) -> Vec<ItemId> {
         return Vec::new();
     }
     let k = known(s);
+    let graph: BTreeSet<mailcraft_model::AccountId> = s
+        .mailbox
+        .accounts
+        .iter()
+        .filter(|a| a.kind == mailcraft_model::AccountKind::Graph)
+        .map(|a| a.id)
+        .collect();
     let mut decided: Vec<(ItemId, FocusClass)> = Vec::new();
     for id in ids.iter().take(super::arrival::MAX_PROCESSED) {
         let Some(m) = s.mailbox.mail.get(*id) else { continue };
         let head = crate::cmd::compose::stored_raw(s, m).map(|raw| crate::cmd::compose::raw_headers(&raw));
-        let (class, _) = classify(m, head.as_ref(), &k);
+        let (class, reason) = classify(m, head.as_ref(), &k);
+        let by_service = s.mailbox.folder(m.folder).is_some_and(|f| graph.contains(&f.account));
+        if by_service && reason != Reason::SenderOverride {
+            // The service classified it already.
+            if m.focus == FocusClass::Other {
+                decided.push((*id, FocusClass::Other));
+            }
+            continue;
+        }
         decided.push((*id, class));
     }
     let mut other = Vec::new();

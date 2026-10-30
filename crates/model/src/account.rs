@@ -10,6 +10,9 @@ pub enum AccountKind {
     Imap,
     Jmap,
     Exchange,
+    /// A Microsoft 365 or Outlook.com mailbox reached through Microsoft Graph (REST over HTTPS, OAuth sign-in);
+    /// `incoming.host` is the API base (`https://graph.microsoft.com/v1.0`).
+    Graph,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,7 +214,7 @@ pub struct DavFolderState {
 }
 
 impl Account {
-    /// True when the account can send (has an outgoing server or is a JMAP/Exchange account).
+    /// True when the account can send (has an outgoing server or is a JMAP/Exchange/Graph account).
     pub fn can_send(&self) -> bool {
         if self.shared.is_some() {
             return false;
@@ -219,7 +222,7 @@ impl Account {
         match self.kind {
             AccountKind::Local => false,
             AccountKind::Imap => self.outgoing.is_some(),
-            AccountKind::Jmap | AccountKind::Exchange => true,
+            AccountKind::Jmap | AccountKind::Exchange | AccountKind::Graph => true,
         }
     }
 

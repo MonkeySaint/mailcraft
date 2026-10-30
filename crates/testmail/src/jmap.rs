@@ -1167,7 +1167,7 @@ fn email_import(ctx: &Ctx, jmap: &SharedJmap, user: &str, args: &Value) -> Value
 }
 
 /// Addresses in the To, Cc and Bcc fields of `raw` (simple `<addr>` / bare address scan).
-fn header_recipients(raw: &[u8]) -> Vec<String> {
+pub(crate) fn header_recipients(raw: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(raw);
     let head = text.split("\r\n\r\n").next().unwrap_or("");
     let mut out = Vec::new();

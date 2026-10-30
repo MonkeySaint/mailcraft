@@ -26,6 +26,10 @@
 //!   and the RFC 2342 other-users and shared IMAP namespaces ([`TestServers::grant_access`],
 //!   [`TestServers::share_mailbox`]).
 //!
+//! - a fake Microsoft Graph mail service (REST v1.0 shapes: mail folders, per-folder message delta queries with
+//!   paging, `$value`, sendMail, drafts, attachments with upload sessions, throttling on demand) on the web
+//!   server's ports under `/graph/v1.0` (`graph.rs`), over the same mail.
+//!
 //! - an OAuth 2.0 authorization server (device grant, authorization code with PKCE, refresh tokens) whose
 //!   access tokens sign in to IMAP and SMTP (XOAUTH2, OAUTHBEARER) and JMAP (Bearer), plus autoconfig
 //!   documents and tenant OpenID configurations, all on a small web server (HTTP and HTTPS); and a fake DNS
@@ -41,6 +45,7 @@ mod conn;
 mod date;
 mod dav;
 mod dns;
+mod graph;
 mod imap;
 mod jmap;
 mod mime;
@@ -148,6 +153,9 @@ pub struct Config {
     /// JMAP Mailbox/set refuses a create that sets a `role` (`invalidProperties`), as servers that leave
     /// roles to themselves.
     pub jmap_refuse_roles: bool,
+    /// Largest page the fake Graph service sends (the client's `Prefer: odata.maxpagesize` is honoured up to
+    /// this), so paging is exercised with little mail.
+    pub graph_max_page: usize,
 }
 
 impl Default for Config {
@@ -181,6 +189,7 @@ impl Default for Config {
             jmap_unsupported_filters: Vec::new(),
             jmap_pim: false,
             jmap_refuse_roles: false,
+            graph_max_page: 50,
         }
     }
 }
@@ -625,6 +634,50 @@ impl TestServers {
     /// DAV requests received ("METHOD /path"), oldest first.
     pub fn dav_requests(&self) -> Vec<String> {
         self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).requests.clone()
+    }
+
+    /// The fake Microsoft Graph API base over HTTPS (`https://127.0.0.1:<webs_port>/graph/v1.0`).
+    pub fn graph_url(&self) -> String {
+        format!("{}/graph/v1.0", self.web_url())
+    }
+
+    /// Makes the next `count` Graph requests answer 429 Too Many Requests with `Retry-After: retry_after`
+    /// (seconds).
+    pub fn graph_throttle(&self, count: u32, retry_after: u64) {
+        let mut g = self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner());
+        g.throttle = count;
+        g.retry_after = retry_after;
+    }
+
+    /// While `on`, Graph refuses to open attachment upload sessions (413, as for a file over its limit).
+    pub fn graph_refuse_uploads(&self, on: bool) {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).refuse_uploads = on;
+    }
+
+    /// Graph requests received ("METHOD /path?query"), oldest first.
+    pub fn graph_requests(&self) -> Vec<String> {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).requests.clone()
+    }
+
+    /// The Graph message id of the message with `uid` in `user`'s `mailbox`.
+    pub fn graph_message_id(&self, user: &str, mailbox: &str, uid: u32) -> Option<String> {
+        let store = self.shared.lock();
+        let m = store.user(user)?.mailbox(mailbox)?.find(uid)?;
+        let g = self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner());
+        Some(g.message_id(user, &m.raw, &m.internal_date))
+    }
+
+    /// Changes what Graph keeps for message `id` beyond the IMAP flags, as another client would:
+    /// `{"categories": [..], "importance": "high", "flag": "complete", "inferenceClassification": "other"}`.
+    pub fn graph_set_meta(&self, user: &str, id: &str, patch: serde_json::Value) {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).set_meta(user, id, &patch);
+        self.shared.notify();
+    }
+
+    /// What Graph keeps for message `id` beyond the IMAP flags: `{"categories", "importance", "complete",
+    /// "other"}`.
+    pub fn graph_meta(&self, user: &str, id: &str) -> serde_json::Value {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).meta_json(user, id)
     }
 
     /// Stops all threads now (also done on drop).

@@ -11,6 +11,9 @@
 //!
 //! - the WebDAV / CardDAV / CalDAV server of [`crate::dav`] under `/dav/` and the `.well-known` DAV locations.
 //!
+//! - the fake Microsoft Graph mail service of [`crate::graph`] under `/graph/v1.0/` (and its upload sessions
+//!   under `/graph-upload/`).
+//!
 //! Every request path is logged ([`crate::TestServers::web_requests`]). One request per connection.
 
 use std::collections::BTreeMap;
@@ -39,9 +42,13 @@ pub type SharedWeb = Arc<Mutex<WebState>>;
 const MAX_LOG: usize = 1000;
 
 pub fn serve(mut conn: Conn, ctx: &Ctx) {
-    if let Ok(Some(req)) = read_request(&mut conn, crate::dav::MAX_RESOURCE + 64 * 1024) {
+    // Graph takes whole messages (base64) in one request.
+    let max = crate::dav::MAX_RESOURCE.max(ctx.config.max_message_size.saturating_mul(2)) + 64 * 1024;
+    if let Ok(Some(req)) = read_request(&mut conn, max) {
         let path = req.path.split('?').next().unwrap_or_default();
-        let _ = if crate::dav::handles(path) {
+        let _ = if crate::graph::handles(path) {
+            crate::graph::handle(&mut conn, ctx, &req)
+        } else if crate::dav::handles(path) {
             crate::dav::handle(&mut conn, ctx, &req)
         } else {
             handle(&mut conn, ctx, &req)

@@ -187,6 +187,7 @@ fn kind_name(k: AccountKind) -> &'static str {
         AccountKind::Imap => "imap",
         AccountKind::Jmap => "jmap",
         AccountKind::Exchange => "exchange",
+        AccountKind::Graph => "graph",
     }
 }
 

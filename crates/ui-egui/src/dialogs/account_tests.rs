@@ -1024,6 +1024,16 @@ fn add_account_recognises_microsoft_365_by_mx_and_signs_in_with_oauth() {
     let mut h = harness(app);
     set_text(&mut h, "Email address:", "robin@m365.example.net");
     h.get_by_label("Connect").click();
+    // Microsoft 365 starts as a Microsoft Graph account (`add_account_offers_microsoft_graph_…`); IMAP is
+    // one manual setup away, with Microsoft 365's servers.
+    wait_for_settings(&mut h, "Microsoft 365 Account Settings");
+    h.get_by_label("< Back").click();
+    step(&mut h);
+    h.get_by_label("Let me set up my account manually").click();
+    step(&mut h);
+    h.get_by_label("Connect").click();
+    step_until(&mut h, "Advanced setup", |h| h.query_by_label("Advanced setup").is_some());
+    h.get_by_label("IMAP").click();
     wait_for_settings(&mut h, "IMAP Account Settings");
     // Microsoft 365's servers, not imap.<domain> / smtp.<domain>.
     assert!(h.query_by_label_contains("(MX) records point at Microsoft 365").is_some());
@@ -1069,6 +1079,65 @@ fn add_account_recognises_microsoft_365_by_mx_and_signs_in_with_oauth() {
             url.starts_with(&format!("https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize")),
             "{url}"
         );
+        a.id
+    };
+    h.get_by_label("Cancel Sign-In").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Cancel Sign-In").click();
+    step(&mut h);
+    assert_eq!(h.state().s.sync.oauth.get(&id).unwrap().status, "cancelled");
+}
+
+#[test]
+fn add_account_offers_microsoft_graph_for_microsoft_365() {
+    const TENANT: &str = "6f1a5c2e-0b7d-4c3a-9e8f-1d2c3b4a5e6f";
+    let servers = mailcraft_testmail::TestServers::start(mailcraft_testmail::Config::default()).unwrap();
+    servers.set_mx(
+        "m365.example.net",
+        vec![mailcraft_testmail::Mx {
+            preference: 0,
+            exchange: "m365-example-net.mail.protection.outlook.com".into(),
+        }],
+    );
+    servers.set_tenant("m365.example.net", Some(TENANT));
+    let mut app = sample_app();
+    app.s.view.work_offline = true;
+    local_lookup(&mut app, &servers);
+    crate::dialogs::open(&mut app, "addAccount", json!({}));
+    let mut h = harness(app);
+    set_text(&mut h, "Email address:", "robin@m365.example.net");
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "Microsoft 365 Account Settings");
+    assert!(h.query_by_label_contains("(MX) records point at Microsoft 365").is_some());
+    assert_eq!(field_value(&h, "Graph endpoint:"), "https://graph.microsoft.com/v1.0");
+    assert!(h.query_by_label("Outgoing server:").is_none(), "Graph sends through the mailbox");
+    assert!(h.query_by_label("Password:").is_none(), "Graph takes no password");
+    assert!(h.query_by_label_contains("Mail.ReadWrite, Mail.Send").is_some());
+    assert!(h.query_by_label_contains("Authenticated SMTP").is_none(), "no IMAP/SMTP hints");
+    assert!(combo_shows(&h, "Microsoft (personal and work or school accounts)"));
+    set_text(&mut h, "Client id:", "org-registered-app");
+    h.get_by_label("Browser").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Browser").click();
+    step(&mut h);
+    h.get_by_label("Sign In").scroll_to_me();
+    step(&mut h);
+    h.get_by_label("Sign In").click();
+    step(&mut h);
+    let id = {
+        let app = h.state();
+        let a = app.s.mailbox.accounts.iter().find(|a| a.address == "robin@m365.example.net").unwrap();
+        assert_eq!(a.kind, mailcraft_model::AccountKind::Graph);
+        assert_eq!(a.incoming.as_ref().unwrap().host, "https://graph.microsoft.com/v1.0");
+        assert!(a.outgoing.is_none());
+        let flow = app.s.sync.oauth.get(&a.id).cloned().unwrap();
+        assert_eq!(flow.status, "waiting", "{:?}", flow.error);
+        let url = flow.auth_url.unwrap_or_default();
+        assert!(
+            url.starts_with(&format!("https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize")),
+            "{url}"
+        );
+        assert!(url.contains("graph.microsoft.com%2FMail.ReadWrite"), "Graph's permissions: {url}");
         a.id
     };
     h.get_by_label("Cancel Sign-In").scroll_to_me();

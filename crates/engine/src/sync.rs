@@ -508,7 +508,7 @@ impl SyncState {
 // =======================================================================================================
 
 fn is_server_account(kind: AccountKind) -> bool {
-    matches!(kind, AccountKind::Imap | AccountKind::Jmap)
+    matches!(kind, AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph)
 }
 
 impl Session {
@@ -1020,6 +1020,29 @@ fn manage_push(s: &mut Session) {
                 s.sync.dirty = true;
             }
         }
+        // Microsoft Graph pushes only to public web endpoints: an account that wants push has its Inbox
+        // polled once it has connected (`tick`).
+        let graph: Vec<AccountId> = s
+            .mailbox
+            .accounts
+            .iter()
+            .filter(|a| a.kind == AccountKind::Graph && a.incoming.is_some())
+            .map(|a| a.id)
+            .collect();
+        for id in graph {
+            let opts = crate::accounts::account_options(s, id);
+            let offline = s.view.work_offline;
+            let Some(run) = s.sync.runs.get_mut(&id) else { continue };
+            let mode = if !offline && opts.push && run.last_sync.is_some() && run.error.is_none() {
+                PushMode::Polling
+            } else {
+                PushMode::Off
+            };
+            if run.push != mode {
+                run.push = mode;
+                s.sync.dirty = true;
+            }
+        }
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -1109,8 +1132,27 @@ pub(crate) fn header_only_leaving(s: &Session, r: &crate::changes::Recording) ->
     let before = r.before_small();
     let after = &s.mailbox;
     let mut out: BTreeSet<ItemId> = BTreeSet::new();
+    // A Graph folder on the service: its account.
+    let graph_folder = |mb: &Mailbox, f: FolderId| {
+        mb.folder(f)
+            .filter(|f| f.kind == FolderKind::Mail && f.remote_name.is_some())
+            .map(|f| f.account)
+            .filter(|a| mb.account(*a).is_some_and(|a| a.kind == AccountKind::Graph))
+    };
     for (id, b) in r.mail_so_far(after) {
         let (Some(b), Some(a)) = (b, after.mail.get(id)) else { continue };
+        if a.folder != b.folder
+            && b.remote_id.is_some()
+            && let Some(src) = graph_folder(after, b.folder).or_else(|| graph_folder(before, b.folder))
+        {
+            // Graph: the service keeps its copy for a move inside the account (outside the Outbox), even
+            // into a folder that stays here.
+            let kept = keeps_server_copy(after, src, a.folder);
+            if !kept && crate::sync::cmds::is_header_only(s, id) {
+                out.insert(id);
+            }
+            continue;
+        }
         if a.folder == b.folder || uid_of(b).is_none() {
             continue;
         }
@@ -1147,6 +1189,31 @@ pub(crate) fn header_only_leaving(s: &Session, r: &crate::changes::Recording) ->
         );
     }
     out.into_iter().collect()
+}
+
+/// True when mail of the Graph account `account` moved into `folder` keeps its copy on the service: any mail
+/// folder of the account outside the Outbox (a folder that stays here, below a default folder the service
+/// does not have, leaves the service's copy where it was). Mail moved anywhere else (another account, a
+/// local folder, the Outbox) leaves the service.
+pub(crate) fn keeps_server_copy(mb: &Mailbox, account: AccountId, folder: FolderId) -> bool {
+    let Some(f) = mb.folder(folder) else { return false };
+    if f.account != account || f.kind != FolderKind::Mail {
+        return false;
+    }
+    let Some(outbox) = mb.role_folder(account, mailcraft_model::FolderRole::Outbox) else { return true };
+    let mut cur = Some(folder);
+    let mut steps = 0usize;
+    while let Some(id) = cur {
+        if id == outbox {
+            return false;
+        }
+        steps = steps.saturating_add(1);
+        if steps > mb.folders.len() {
+            break;
+        }
+        cur = mb.folder(id).and_then(|x| x.parent);
+    }
+    true
 }
 
 /// Server changes queued for `account`.
@@ -1253,6 +1320,14 @@ pub(crate) fn queue_local_changes(s: &mut Session, changes: &mut crate::changes:
             s.mailbox.accounts.iter().filter(|a| a.kind == AccountKind::Jmap).map(|a| a.id).collect();
         for a in jmap {
             if jmap::changed(&changes.small, mail, &s.mailbox, a) {
+                s.sync.jmap_dirty.insert(a);
+            }
+        }
+        // Microsoft Graph accounts have no change queue either: a run sends what differs from the shadow.
+        let graph: Vec<AccountId> =
+            s.mailbox.accounts.iter().filter(|a| a.kind == AccountKind::Graph).map(|a| a.id).collect();
+        for a in graph {
+            if graph::changed(&changes.small, mail, &s.mailbox, a) {
                 s.sync.jmap_dirty.insert(a);
             }
         }
@@ -1691,7 +1766,11 @@ pub(crate) fn after_restore(s: &mut Session, changes: &mut crate::changes::Chang
     pim::carry_over(live, &mut s.mailbox, &s.sync.track.pim_created, &s.sync.track.pim_removed);
     // IMAP and JMAP accounts alike: without this, a JMAP folder or message the server added meanwhile would
     // be missing from the restored mailbox and the next run would remove it from the server.
-    if !live.accounts.iter().any(|a| matches!(a.kind, AccountKind::Imap | AccountKind::Jmap)) {
+    if !live
+        .accounts
+        .iter()
+        .any(|a| matches!(a.kind, AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph))
+    {
         return;
     }
     let Some(live_mail) = changes.mail.as_ref() else { return };
@@ -1774,11 +1853,12 @@ fn carry_over(live: &Mailbox, live_mail: &MailChanges, restored: &mut Mailbox, t
             restored.mail.remove(*id);
         }
     }
-    // JMAP email ids stay the same when a message moves between mailboxes of its account (IMAP UIDs do not).
+    // JMAP email ids and Graph message ids (immutable ids) stay the same when a message moves between folders
+    // of its account (IMAP UIDs do not).
     let jmap_account = |mb: &Mailbox, f: FolderId| {
-        mb.folder(f)
-            .map(|f| f.account)
-            .filter(|a| mb.account(*a).is_some_and(|a| a.kind == AccountKind::Jmap))
+        mb.folder(f).map(|f| f.account).filter(|a| {
+            mb.account(*a).is_some_and(|a| matches!(a.kind, AccountKind::Jmap | AccountKind::Graph))
+        })
     };
     let put_back: Vec<(ItemId, FolderId, Option<String>, bool, FlagState)> = live_mail
         .iter()
@@ -1938,6 +2018,8 @@ pub mod cmds;
 #[cfg(not(target_arch = "wasm32"))]
 mod dav;
 pub mod focus;
+#[cfg(not(target_arch = "wasm32"))]
+mod graph;
 pub mod groups;
 #[cfg(not(target_arch = "wasm32"))]
 mod jmap;

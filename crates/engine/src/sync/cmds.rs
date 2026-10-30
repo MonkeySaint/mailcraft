@@ -100,9 +100,9 @@ pub fn slow_headers_only(s: &Session) -> bool {
 }
 
 fn server_account(s: &Session, id: AccountId) -> bool {
-    s.mailbox
-        .account(id)
-        .is_some_and(|a| matches!(a.kind, AccountKind::Imap | AccountKind::Jmap) && a.incoming.is_some())
+    s.mailbox.account(id).is_some_and(|a| {
+        matches!(a.kind, AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph) && a.incoming.is_some()
+    })
 }
 
 /// Download Headers: the folder's account downloads the headers of new messages (bodies later, on demand).
