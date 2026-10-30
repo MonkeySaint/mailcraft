@@ -100,6 +100,8 @@ pub struct GraphState {
     /// Upload sessions are refused (as for a file over the service's limit).
     pub refuse_uploads: bool,
     pub requests: Vec<String>,
+    /// Contacts, calendars and To Do tasks (`graph_pim.rs`).
+    pub pim: crate::graph_pim::PimState,
 }
 
 pub type SharedGraph = Arc<Mutex<GraphState>>;
@@ -359,7 +361,10 @@ fn reason(status: u16) -> &'static str {
         204 => "204 No Content",
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
+        403 => "403 Forbidden",
         404 => "404 Not Found",
+        405 => "405 Method Not Allowed",
+        412 => "412 Precondition Failed",
         409 => "409 Conflict",
         410 => "410 Gone",
         416 => "416 Range Not Satisfiable",
@@ -808,7 +813,10 @@ fn route(
             );
             (200, json!({"uploadUrl": format!("{origin}{UPLOAD_PREFIX}{sid}"), "nextExpectedRanges": ["0-"]}))
         }
-        _ => err(400, "BadRequest", &format!("unsupported request {m} /{}", segs.join("/"))),
+        _ => match crate::graph_pim::route(ctx, user, m, segs, q, body, page, base) {
+            Some(answer) => answer,
+            None => err(400, "BadRequest", &format!("unsupported request {m} /{}", segs.join("/"))),
+        },
     }
 }
 

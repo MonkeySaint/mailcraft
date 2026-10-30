@@ -2160,12 +2160,13 @@ fn oauth_sign_in(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 /// A Graph account signs in for Microsoft Graph's delegated permissions instead of the mail protocols' (one
-/// token serves one resource): the Microsoft provider gets `mailcraft_net::graph::MAIL_SCOPES` in place of its
-/// IMAP/POP/SMTP scopes; a custom provider without scopes gets them too.
+/// token serves one resource): the Microsoft provider gets `mailcraft_net::graph::MAIL_SCOPES` and the contacts, calendars and
+/// tasks permissions (`mailcraft_net::graph::pim::PIM_SCOPES`) in place of its IMAP/POP/SMTP scopes; a custom provider
+/// without scopes gets them too.
 fn graph_scopes(b: &mut OAuthBinding) {
     #[cfg(not(target_arch = "wasm32"))]
     if b.provider == "microsoft" || (b.provider == "custom" && b.scopes.is_empty()) {
-        b.scopes = mailcraft_net::graph::scopes(&[]);
+        b.scopes = mailcraft_net::graph::scopes(&mailcraft_net::graph::pim::PIM_SCOPES);
     }
     #[cfg(target_arch = "wasm32")]
     let _ = b;

@@ -25,6 +25,11 @@
 //! `https://jmap.invalid/…`, so the rules below are the same). With a DAV server set, all three folders keep
 //! using it. Tasks stay on the CalDAV server of its DAV settings, if any.
 //!
+//! **Microsoft Graph.** A Microsoft 365 (Graph) account without a DAV server keeps its Contacts, Calendar
+//! and Tasks on the service ([`via_graph`]; `graph_pim.rs` shows its contact folders, calendars and To Do
+//! lists as collections at `https://graph.invalid/…`, read from delta queries). Calendars other people
+//! shared with the user (and those opened by address) go below a Shared Calendars folder.
+//!
 //! **Rules.** Changed here and unchanged there: uploaded with `If-Match`. Changed there: the server copy
 //! replaces the local one unless the item was also changed here, in which case the local copy is uploaded
 //! over it on the next run (the newer edit wins; nothing is lost silently mid-run). New here: uploaded with
@@ -714,6 +719,10 @@ pub struct FolderJob {
     /// Mapped collection (`None`: the first one discovery finds).
     pub collection: Option<String>,
     pub known: BTreeMap<String, String>,
+    /// Microsoft Graph: the delta link to continue from (empty: list the collection whole) and when the
+    /// collection was last listed whole.
+    pub delta: String,
+    pub delta_at: i64,
     pub items: Vec<LocalItem>,
     /// The folder holds more than [`MAX_ITEMS`] items: it is not synchronised (a partial view would make
     /// the items left out look deleted here).
@@ -769,6 +778,9 @@ pub struct FolderOutcome {
     pub known: BTreeMap<String, String>,
     /// Items that could not be synchronised (the rest went through).
     pub errors: Vec<String>,
+    /// Microsoft Graph: the delta link the next run continues from and when the collection was listed whole
+    /// (kept only when everything listed was applied).
+    pub delta: Option<(String, i64)>,
 }
 
 /// What a DAV run reports to the session.
@@ -784,6 +796,21 @@ pub enum PimEvent {
     FolderFailed {
         folder: FolderId,
         error: String,
+    },
+    /// Microsoft Graph: calendars of other people the user may only read (their folders are read-only
+    /// here), out of the Graph calendars just listed.
+    GraphCalendars {
+        read_only: Vec<String>,
+        listed: Vec<String>,
+    },
+    /// Microsoft Graph: what became of a meeting answer waiting to go to the service.
+    GraphResponded {
+        uid: String,
+        outcome: GraphAnswer,
+    },
+    /// Microsoft Graph: meetings (their addresses) whose cancellation went with the user's note.
+    GraphCancelled {
+        urls: Vec<String>,
     },
     Published {
         folder: FolderId,
@@ -823,12 +850,46 @@ pub fn via_ews(a: &mailcraft_model::Account, _kind: PimKind) -> bool {
     a.kind == mailcraft_model::AccountKind::Exchange && a.dav.as_ref().is_none_or(|d| d.url.trim().is_empty())
 }
 
-/// The protocol a collection address belongs to: 1 JMAP, 2 Exchange, 0 WebDAV.
+/// What became of a meeting answer sent to Microsoft Graph ([`PimEvent::GraphResponded`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphAnswer {
+    /// The service took it (and told the organizer when asked to).
+    Sent,
+    /// A passing failure (the network, the service busy): it stays queued for the next run.
+    Retry(String),
+    /// The service has no event for the meeting (an invitation it never put on the calendar, or one
+    /// removed there): the answer goes to the organizer as an iCalendar reply by mail instead.
+    NotOnService,
+    /// The service refused it for good: dropped, and said in the status.
+    Refused(String),
+}
+
+/// Runs a meeting answer is tried for a passing reason before it goes by mail instead.
+pub const MAX_ANSWER_ATTEMPTS: u32 = 10;
+
+/// Origin of the addresses a Microsoft Graph account's contact folders, calendars, To Do lists and their
+/// objects get (see `graph_pim.rs`; `.invalid` never reaches the network).
+pub const GRAPH_ORIGIN: &str = "https://graph.invalid";
+
+/// True for an address of a Microsoft Graph collection or object (see [`GRAPH_ORIGIN`]).
+pub fn is_graph_url(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with(&format!("{GRAPH_ORIGIN}/"))
+}
+
+/// True when `a` keeps `kind` on Microsoft Graph: a Graph account whose settings name no DAV server (one
+/// with a DAV server keeps using it).
+pub fn via_graph(a: &mailcraft_model::Account, _kind: PimKind) -> bool {
+    a.kind == mailcraft_model::AccountKind::Graph && a.dav.as_ref().is_none_or(|d| d.url.trim().is_empty())
+}
+
+/// The protocol a collection address belongs to: 1 JMAP, 2 Exchange, 3 Microsoft Graph, 0 WebDAV.
 fn protocol_of(url: &str) -> u8 {
     if is_jmap_url(url) {
         1
     } else if is_ews_url(url) {
         2
+    } else if is_graph_url(url) {
+        3
     } else {
         0
     }
@@ -853,6 +914,7 @@ pub fn via_jmap(a: &mailcraft_model::Account, kind: PimKind) -> bool {
 pub fn kind_on(a: &mailcraft_model::Account, kind: PimKind) -> bool {
     via_jmap(a, kind)
         || via_ews(a, kind)
+        || via_graph(a, kind)
         || a.dav.as_ref().is_some_and(|d| !d.url.trim().is_empty() && kind.enabled(d))
 }
 
@@ -892,14 +954,23 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
     let want = match s.mailbox.account(account) {
         Some(a) if via_jmap(a, kind) => 1,
         Some(a) if via_ews(a, kind) => 2,
+        Some(a) if via_graph(a, kind) => 3,
         _ => 0,
     };
     let state = state.filter(|st| st.collection.is_empty() || protocol_of(&st.collection) == want);
     let collection = state.as_ref().map(|st| st.collection.clone()).filter(|c| !c.is_empty());
-    let known = state.map(|st| st.known).unwrap_or_default();
+    let (known, delta, delta_at) = state.map(|st| (st.known, st.delta, st.delta_at)).unwrap_or_default();
     let now = s.now();
-    let mut job =
-        FolderJob { folder, kind, collection: collection.clone(), known, items: Vec::new(), too_many: false };
+    let mut job = FolderJob {
+        folder,
+        kind,
+        collection: collection.clone(),
+        known,
+        delta,
+        delta_at,
+        items: Vec::new(),
+        too_many: false,
+    };
     let count = match kind {
         PimKind::Contacts => s.mailbox.contacts.values().filter(|c| c.folder == folder).count(),
         PimKind::Tasks => s.mailbox.tasks.values().filter(|t| t.folder == folder).count(),
@@ -1077,6 +1148,28 @@ pub(super) fn apply(s: &mut Session, account: AccountId, ev: PimEvent) {
             }
         }
         PimEvent::Folder(out) => apply_folder(s, account, *out),
+        PimEvent::GraphCalendars { read_only, listed } => {
+            let folders: Vec<(FolderId, String)> = s
+                .mailbox
+                .account(account)
+                .map(|a| a.sync.dav.iter().map(|(f, st)| (*f, st.collection.clone())).collect())
+                .unwrap_or_default();
+            for (f, c) in folders {
+                if !listed.contains(&c) {
+                    continue;
+                }
+                let ro = read_only.contains(&c);
+                if crate::cmd::calendar::props::is_read_only(&s.mailbox, f) != ro {
+                    crate::cmd::calendar::props::update(&mut s.mailbox, f, |p| p.read_only = ro);
+                }
+            }
+        }
+        PimEvent::GraphResponded { uid, outcome } => graph_responded(s, account, &uid, outcome),
+        PimEvent::GraphCancelled { urls } => {
+            if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
+                a.sync.graph_cancels.retain(|c| !urls.contains(&c.url));
+            }
+        }
         PimEvent::FolderFailed { folder, error } => {
             let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
             log::warn!("DAV sync of folder {name}: {error}");
@@ -1142,23 +1235,112 @@ fn map_collections(
             continue;
         }
         let default_free = !mapped.contains_key(&default) || gone.contains(&default);
-        let folder = if i == 0 && default_free {
+        let shared = super::graph_shared_url(url);
+        let folder = if i == 0 && default_free && !shared {
             default
         } else {
-            let Some(f) = create_folder(s, account, default, kind, name) else { continue };
+            // Other people's calendars go below Shared Calendars.
+            let parent = if shared { shared_calendars(s, account, default) } else { Some(default) };
+            let Some(parent) = parent else { continue };
+            let Some(f) = create_folder(s, account, parent, kind, name) else { continue };
             created.push(f);
             f
         };
         if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
-            a.sync.dav.insert(folder, DavFolderState { collection: url.clone(), known: BTreeMap::new() });
+            a.sync.dav.insert(folder, DavFolderState { collection: url.clone(), ..Default::default() });
         }
         taken.insert(url.clone());
     }
     created
 }
 
+/// Applies what became of the meeting answer for `uid` waiting on `account` (see [`GraphAnswer`]).
+fn graph_responded(s: &mut Session, account: AccountId, uid: &str, outcome: GraphAnswer) {
+    let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) else { return };
+    let Some(pos) = a.sync.graph_responses.iter().position(|r| r.uid == uid) else { return };
+    let by_mail = match outcome {
+        GraphAnswer::Sent => {
+            a.sync.graph_responses.remove(pos);
+            return;
+        }
+        GraphAnswer::Retry(e) => {
+            let Some(r) = a.sync.graph_responses.get_mut(pos) else { return };
+            r.attempts = r.attempts.saturating_add(1);
+            log::info!("meeting answer for {uid} not sent yet ({} tries): {e}", r.attempts);
+            if r.attempts < MAX_ANSWER_ATTEMPTS {
+                s.sync.runs.entry(account).or_default().error =
+                    Some(format!("A meeting answer could not be sent yet and is tried again: {e}"));
+                return;
+            }
+            true
+        }
+        GraphAnswer::NotOnService => true,
+        GraphAnswer::Refused(e) => {
+            a.sync.graph_responses.remove(pos);
+            log::warn!("meeting answer for {uid}: {e}");
+            s.sync.runs.entry(account).or_default().error =
+                Some(format!("A meeting answer could not be sent: {e}"));
+            return;
+        }
+    };
+    if !by_mail {
+        return;
+    }
+    let r = a.sync.graph_responses.remove(pos);
+    if !r.send {
+        // Not to be told: the calendar here already has the answer.
+        return;
+    }
+    // The service cannot answer for a meeting it does not have: the organizer gets an iCalendar reply.
+    let problem = match crate::cmd::calendar::reply_by_mail(s, ItemId(r.mail), &r.response, &r.comment) {
+        Ok(true) => return,
+        Ok(false) => "it stays in the Outbox".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    log::warn!("meeting answer for {uid} by mail: {problem}");
+    s.sync.runs.entry(account).or_default().error =
+        Some(format!("A meeting answer could not be sent by mail: {problem}"));
+}
+
 /// Most collections of one kind mapped to folders.
 pub const MAX_COLLECTIONS: usize = 50;
+
+/// True while folder `f` holds a calendar that stays open: it exists and is not in its account's Deleted
+/// Items (a calendar deleted there is closed).
+pub(crate) fn open_calendar_folder(mb: &Mailbox, f: FolderId) -> bool {
+    let Some(folder) = mb.folder(f) else { return false };
+    mb.role_folder(folder.account, FolderRole::DeletedItems).is_none_or(|d| !mb.is_in_subtree(f, d))
+}
+
+/// Name of the folder other people's calendars go below.
+pub const SHARED_CALENDARS: &str = "Shared Calendars";
+
+/// The account's Shared Calendars folder (beside its Calendar), made when missing.
+pub(crate) fn shared_calendars(s: &mut Session, account: AccountId, calendar: FolderId) -> Option<FolderId> {
+    let parent = s.mailbox.folder(calendar).and_then(|f| f.parent);
+    if let Some(f) = s.mailbox.folders.values().find(|f| {
+        f.account == account
+            && f.parent == parent
+            && f.kind == FolderKind::Calendar
+            && f.name == SHARED_CALENDARS
+    }) {
+        return Some(f.id);
+    }
+    let id = FolderId(s.mailbox.alloc_id());
+    s.mailbox.folders.insert(
+        id,
+        Folder {
+            id,
+            account,
+            parent,
+            name: SHARED_CALENDARS.into(),
+            kind: FolderKind::Calendar,
+            ..Default::default()
+        },
+    );
+    s.sync.track.folders_created.insert(id);
+    Some(id)
+}
 
 fn create_folder(
     s: &mut Session,
@@ -1212,6 +1394,57 @@ fn merged_contact(new: Contact, old: Option<&Contact>) -> Contact {
         Some(o) => Contact { id: o.id, folder: o.folder, flag: o.flag.clone(), ..new },
         None => new,
     }
+}
+
+/// Contact kinds of phone numbers and postal addresses Microsoft Graph holds (`graph_items.rs`): one mobile
+/// number, business and home numbers, business, home and other addresses.
+const GRAPH_PHONES: [&str; 3] = ["Business", "Home", "Mobile"];
+const GRAPH_ADDRESSES: [&str; 3] = ["Business", "Home", "Other"];
+/// Most phone numbers and addresses one contact keeps.
+const MAX_LIST: usize = 200;
+
+/// The server's copy `new` of contact `old` ([`merged_contact`]). From Microsoft Graph (`graph`) only what
+/// the service holds is taken: the phone numbers of other kinds (fax, pager, other…) and mobile numbers
+/// past the first, the addresses of other kinds, the anniversary, the picture, the certificates and
+/// privacy stay as they are here.
+fn server_contact(new: Contact, old: &Contact, graph: bool) -> Contact {
+    let mut c = merged_contact(new, Some(old));
+    if !graph {
+        return c;
+    }
+    let mut mobiles = 0usize;
+    for (kind, number) in &old.phones {
+        let kept = match kind.as_str() {
+            "Mobile" => {
+                mobiles = mobiles.saturating_add(1);
+                mobiles > 1
+            }
+            k => !GRAPH_PHONES.contains(&k),
+        };
+        if kept && c.phones.len() < MAX_LIST {
+            c.phones.push((kind.clone(), number.clone()));
+        }
+    }
+    for a in old.addresses.iter().filter(|a| !GRAPH_ADDRESSES.contains(&a.kind.as_str())) {
+        if c.addresses.len() < MAX_LIST {
+            c.addresses.push(a.clone());
+        }
+    }
+    c.anniversary.clone_from(&old.anniversary);
+    c.picture.clone_from(&old.picture);
+    c.certificates.clone_from(&old.certificates);
+    c.private = old.private;
+    c
+}
+
+/// The server's copy `new` of task `old` ([`merged_task`]). Microsoft To Do (`graph`) keeps no percentage:
+/// while the status stays what it is here, so does the percentage complete.
+fn server_task(new: Task, old: &Task, graph: bool) -> Task {
+    let mut t = merged_task(new, Some(old));
+    if graph && t.status == old.status && t.status != mailcraft_model::task::TaskStatus::Completed {
+        t.percent_complete = old.percent_complete;
+    }
+    t
 }
 
 /// A task from the server, keeping what only lives here (its mail link, task request details, privacy).
@@ -1318,6 +1551,8 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
     for inc in out.incoming {
         // What MailCraft does not model of the server copy goes back with the next upload of the item.
         let raw = kept(kind, &inc.data);
+        // Microsoft Graph holds only some of an item's properties: the rest stays as it is here.
+        let graph = is_graph_url(&inc.url);
         let remote = |uid: String, synced: u64| RemoteRef {
             url: inc.url.clone(),
             etag: inc.etag.clone(),
@@ -1336,13 +1571,13 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
                 let old = inc.local.and_then(|(id, fp)| s.mailbox.contacts.get(&id).map(|c| (c.clone(), fp)));
                 match old {
                     Some((o, fp)) if contact_fingerprint(&o) == fp => {
-                        let mut c = merged_contact(card, Some(&o));
+                        let mut c = server_contact(card, &o, graph);
                         c.remote = Some(remote(uid, contact_fingerprint(&c)));
                         s.mailbox.contacts.insert(c.id, c);
                     }
                     Some((o, _)) => {
                         // Changed here while the run went on: this copy wins on the next run.
-                        let synced = contact_fingerprint(&merged_contact(card, Some(&o)));
+                        let synced = contact_fingerprint(&server_contact(card, &o, graph));
                         if let Some(c) = s.mailbox.contacts.get_mut(&o.id) {
                             c.remote = Some(remote(uid, synced));
                         }
@@ -1369,14 +1604,14 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
                 let old = inc.local.and_then(|(id, fp)| s.mailbox.tasks.get(&id).map(|t| (t.clone(), fp)));
                 match old {
                     Some((o, fp)) if task_fingerprint(&o) == fp => {
-                        let mut t = merged_task(task, Some(&o));
+                        let mut t = server_task(task, &o, graph);
                         t.uid = if uid.is_empty() { o.uid.clone() } else { uid.clone() };
                         t.modified = Some(now);
                         t.remote = Some(remote(uid, task_fingerprint(&t)));
                         s.mailbox.tasks.insert(t.id, t);
                     }
                     Some((o, _)) => {
-                        let synced = task_fingerprint(&merged_task(task, Some(&o)));
+                        let synced = task_fingerprint(&server_task(task, &o, graph));
                         if let Some(t) = s.mailbox.tasks.get_mut(&o.id) {
                             t.remote = Some(remote(uid, synced));
                         }
@@ -1427,6 +1662,19 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
                         }
                     }
                     None if claimed.contains(&inc.url) => {}
+                    // The same meeting already here without a server copy (an invitation placed from its
+                    // mail while the service put it on the calendar too): the server copy takes it over.
+                    None if let Some((lead, members)) = unlinked_group(s, &groups, &uid) => {
+                        let placed = place_events(s, folder, events, Some(lead), &members);
+                        let fp = group_synced(s, &placed);
+                        if let Some(a) = placed.first().and_then(|l| s.mailbox.appointments.get_mut(l)) {
+                            a.remote = Some(remote(uid, fp));
+                        }
+                        groups.remove(&lead);
+                        if let Some(&l) = placed.first() {
+                            groups.insert(l, placed);
+                        }
+                    }
                     None => {
                         let placed = place_events(s, folder, events, None, &[]);
                         let fp = group_synced(s, &placed);
@@ -1492,7 +1740,14 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
         }
     }
     if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
-        a.sync.dav.insert(folder, DavFolderState { collection: out.collection, known });
+        // A delta link advances only when everything listed was applied: what could not be is listed again.
+        let prev = a.sync.dav.get(&folder).cloned().unwrap_or_default();
+        let (delta, delta_at) = match out.delta {
+            Some((d, t)) if problems.is_empty() => (d, t),
+            _ if prev.collection == out.collection => (prev.delta, prev.delta_at),
+            _ => (String::new(), 0),
+        };
+        a.sync.dav.insert(folder, DavFolderState { collection: out.collection, known, delta, delta_at });
     }
     if !problems.is_empty() {
         let name = s.mailbox.folder(folder).map(|f| f.name.clone()).unwrap_or_default();
@@ -1503,6 +1758,25 @@ fn apply_folder(s: &mut Session, account: AccountId, out: FolderOutcome) {
         s.sync.runs.entry(account).or_default().error =
             Some(format!("{name}: {} item(s) could not be synchronised ({first})", problems.len()));
     }
+}
+
+/// The event group of the folder (by lead, from `groups`) with iCalendar UID `uid` whose lead has no server
+/// copy: (lead, members).
+fn unlinked_group(
+    s: &Session,
+    groups: &BTreeMap<ItemId, Vec<ItemId>>,
+    uid: &str,
+) -> Option<(ItemId, Vec<ItemId>)> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        return None;
+    }
+    groups
+        .iter()
+        .find(|(lead, _)| {
+            s.mailbox.appointments.get(lead).is_some_and(|a| a.remote.is_none() && a.uid.trim() == uid)
+        })
+        .map(|(l, m)| (*l, m.clone()))
 }
 
 /// Puts a server object's appointments into `folder` in place of `members` (the group they update; empty for
@@ -1881,9 +2155,7 @@ mod tests {
         let folder = s.mailbox.role_folder(account, FolderRole::Tasks).unwrap();
         let collection = "https://dav.example.com/t/";
         if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
-            a.sync
-                .dav
-                .insert(folder, DavFolderState { collection: collection.into(), known: BTreeMap::new() });
+            a.sync.dav.insert(folder, DavFolderState { collection: collection.into(), ..Default::default() });
         }
         let remote = RemoteRef {
             url: format!("{collection}u1.ics"),
@@ -1905,6 +2177,36 @@ mod tests {
         assert!(!job.too_many);
     }
 
+    /// Integration of the Exchange and Microsoft Graph kinds: a folder keeps only a collection of its
+    /// account's own protocol (JMAP, Exchange, Graph or WebDAV), so a link made for one is never sent to
+    /// another.
+    #[test]
+    fn a_folder_keeps_only_a_collection_of_its_own_protocol() {
+        let (mut s, account) = local_session();
+        let folder = s.mailbox.role_folder(account, FolderRole::Contacts).unwrap();
+        let ews = format!("{EWS_ORIGIN}/folders/contacts/");
+        let graph = format!("{GRAPH_ORIGIN}/me/contactFolders/c1/");
+        let dav = "https://dav.example.com/c/".to_owned();
+        let collection_for = |s: &mut Session, kind, collection: &str| {
+            if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
+                a.kind = kind;
+                a.dav = None;
+                a.sync
+                    .dav
+                    .insert(folder, DavFolderState { collection: collection.into(), ..Default::default() });
+            }
+            folder_job(s, account, folder, PimKind::Contacts).collection
+        };
+        use mailcraft_model::AccountKind::{Exchange, Graph};
+        assert_eq!(collection_for(&mut s, Exchange, &ews), Some(ews.clone()));
+        assert_eq!(collection_for(&mut s, Exchange, &graph), None, "a Graph link is not Exchange's");
+        assert_eq!(collection_for(&mut s, Exchange, &dav), None);
+        assert_eq!(collection_for(&mut s, Graph, &graph), Some(graph.clone()));
+        assert_eq!(collection_for(&mut s, Graph, &ews), None, "an Exchange link is not Graph's");
+        assert_eq!(collection_for(&mut s, Graph, &dav), None);
+        assert!(is_ews_url(&ews) && !is_graph_url(&ews) && is_graph_url(&graph) && !is_ews_url(&graph));
+    }
+
     /// Regression (review): a contact whose link was dropped because the account changed protocol (DAV to
     /// JMAP) got a new UID, so the server's copy of it on the new collection could not be matched and it
     /// went up a second time.
@@ -1918,7 +2220,7 @@ mod tests {
             a.kind = mailcraft_model::AccountKind::Jmap;
             a.dav = None;
             a.sync.jmap_contacts = true;
-            a.sync.dav.insert(folder, DavFolderState { collection: old.into(), known: BTreeMap::new() });
+            a.sync.dav.insert(folder, DavFolderState { collection: old.into(), ..Default::default() });
         }
         assert!(via_jmap(s.mailbox.account(account).unwrap(), PimKind::Contacts));
         let remote = |uid: &str| RemoteRef {
@@ -2191,9 +2493,7 @@ mod tests {
         let folder = s.mailbox.role_folder(account, FolderRole::Contacts).unwrap();
         let collection = "https://dav.example.com/card/";
         if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
-            a.sync
-                .dav
-                .insert(folder, DavFolderState { collection: collection.into(), known: BTreeMap::new() });
+            a.sync.dav.insert(folder, DavFolderState { collection: collection.into(), ..Default::default() });
         }
         let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:c-2\r\nFN:Pat Example\r\nN:Example;Pat;;;\r\n\
             X-EVOLUTION-SPOUSE:Alex\r\nX-OTHER:1\r\nEND:VCARD\r\n";

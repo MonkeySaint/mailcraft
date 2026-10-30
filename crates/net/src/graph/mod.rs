@@ -5,8 +5,8 @@
 //! access token, JSON requests and answers, collections paged through `@odata.nextLink`, delta queries that end
 //! with an `@odata.deltaLink`, and throttling (HTTP 429, and 503/504 for requests that may be repeated) waited
 //! out as the server's `Retry-After` asks, within bounds. The mail resources (mail folders, messages, delta,
-//! MIME content, sending, attachments with upload sessions) are in [`mail`]; calendars, contacts and tasks
-//! build on the same client.
+//! MIME content, sending, attachments with upload sessions) are in [`mail`]; contacts, calendars and To Do
+//! tasks (delta rounds, meeting responses, the mailbox time zone) in [`pim`].
 //!
 //! **Hostile input.** Every answer is size-capped ([`GraphClient::max_json`], [`GraphClient::max_content`]),
 //! collections are read up to a caller-given number of entries, and a `nextLink` or `deltaLink` that leaves the
@@ -18,6 +18,7 @@
 //! message's new id).
 
 pub mod mail;
+pub mod pim;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -149,6 +150,8 @@ pub struct GraphClient {
     pub page_size: u32,
     /// Most retries of one throttled request.
     pub max_retries: u32,
+    /// Further `Prefer` preferences sent with every request (`outlook.timezone="UTC"`).
+    pub prefer: Vec<String>,
     cancel: Option<Arc<AtomicBool>>,
     throttled: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -177,6 +180,7 @@ impl GraphClient {
             max_content: MAX_CONTENT,
             page_size: 100,
             max_retries: MAX_RETRIES,
+            prefer: Vec::new(),
             cancel: None,
             throttled: Arc::default(),
         })
@@ -262,6 +266,10 @@ impl GraphClient {
         if self.page_size > 0 {
             prefer.push_str(", ");
             prefer.push_str(&pages);
+        }
+        for p in self.prefer.iter().map(|p| p.trim()).filter(|p| !p.is_empty() && !p.contains(['\r', '\n'])) {
+            prefer.push_str(", ");
+            prefer.push_str(p);
         }
         let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/json"), ("Prefer", &prefer)];
         if authorized {

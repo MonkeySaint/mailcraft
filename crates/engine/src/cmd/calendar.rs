@@ -1046,8 +1046,12 @@ fn run_change_time_zone(s: &mut Session, p: &Value) -> CmdResult {
 ///   fetched `data`.
 /// - `file` `{path | data, name?}`: a new calendar holding a copy of an .ics file's events.
 /// - `blank` `{name, parent?}`: Create New Blank Calendar.
-/// - `addressBook`, `roomList`, `shared`: other people's and rooms' calendars live on an Exchange server,
-///   which MailCraft does not connect to; refused with the reason.
+/// - `shared` `{address, name?, account?}` (Open Shared Calendar) and `addressBook` `{contact | address,
+///   name?, account?}` (From Address Book): another person's calendar on a Microsoft 365 (Graph) account,
+///   read (and, when they allow it, changed) through the service; it goes below Shared Calendars. Without
+///   such an account: refused with the reason.
+/// - `roomList`: room lists live in the organization's directory, which MailCraft does not read; refused
+///   (a room's calendar opens by its address with `shared`).
 fn run_add_calendar(s: &mut Session, p: &Value) -> CmdResult {
     let Some(source) = opt_str(p, "source") else {
         return pim::dialog(s, "addCalendar", json!({}));
@@ -1056,12 +1060,153 @@ fn run_add_calendar(s: &mut Session, p: &Value) -> CmdResult {
         "internet" => add_internet_calendar(s, p),
         "file" => add_file_calendar(s, p),
         "blank" => add_blank_calendar(s, p),
-        "addressBook" | "roomList" | "shared" => Err(CmdError::Disabled(
-            "opening other people's, rooms' and shared calendars needs a Microsoft Exchange account, which \
-             MailCraft does not support; subscribe to an internet calendar (From Internet) instead"
+        "addressBook" | "shared" => add_shared_calendar(s, p, source),
+        "roomList" => Err(CmdError::Disabled(
+            "room lists come from the organization's directory, which MailCraft does not read; open a room's \
+             calendar by its address with Open Shared Calendar on a Microsoft 365 account"
                 .into(),
         )),
         _ => Err(CmdError::Params("`source` must be internet|file|blank|addressBook|roomList|shared".into())),
+    }
+}
+
+/// The Microsoft 365 (Graph) accounts whose calendars live on the service.
+pub fn graph_calendar_accounts(s: &Session) -> Vec<mailcraft_model::AccountId> {
+    s.mailbox
+        .accounts
+        .iter()
+        .filter(|a| crate::sync::pim::via_graph(a, crate::sync::pim::PimKind::Calendar))
+        .map(|a| a.id)
+        .collect()
+}
+
+/// Add Calendar › Open Shared Calendar / From Address Book on a Microsoft 365 account: another person's
+/// default calendar (`/users/{address}/calendar`) in a folder below Shared Calendars, updated right away.
+fn add_shared_calendar(s: &mut Session, p: &Value, source: &str) -> CmdResult {
+    let accounts = graph_calendar_accounts(s);
+    let account =
+        match opt_u64(p, "account").and_then(|a| u32::try_from(a).ok()).map(mailcraft_model::AccountId) {
+            Some(a) if accounts.contains(&a) => a,
+            Some(a) => {
+                return Err(CmdError::Params(format!("account {} keeps no calendars on Microsoft 365", a.0)));
+            }
+            None => match accounts.first() {
+                Some(a) => *a,
+                None => {
+                    return Err(CmdError::Disabled(
+                    "opening other people's calendars needs a Microsoft 365 account (its calendars are read \
+                     through Microsoft Graph); subscribe to an internet calendar (From Internet) instead"
+                        .into(),
+                ));
+                }
+            },
+        };
+    let contact = opt_u64(p, "contact").map(ItemId).and_then(|c| s.mailbox.contacts.get(&c)).cloned();
+    if opt_u64(p, "contact").is_some() && contact.is_none() {
+        return Err(CmdError::Params("no such contact".into()));
+    }
+    let address = pim::text(p, "address")?
+        .map(|a| a.trim().to_owned())
+        .filter(|a| !a.is_empty())
+        .or_else(|| contact.as_ref().and_then(|c| c.emails.first().cloned()));
+    let Some(address) = address else {
+        if source == "addressBook" {
+            // From Address Book: the person is picked from the contacts with an address.
+            let mut people: Vec<&mailcraft_model::Contact> =
+                s.mailbox.contacts.values().filter(|c| c.emails.iter().any(|e| e.contains('@'))).collect();
+            people.sort_by_key(|c| (c.full_name().to_lowercase(), c.id));
+            let ids: Vec<u64> = people.iter().take(500).map(|c| c.id.0).collect();
+            return pim::dialog(
+                s,
+                "chooseContact",
+                json!({ "ids": ids, "pick": "addCalendar", "account": account.0 }),
+            );
+        }
+        return pim::dialog(s, "addCalendar", json!({ "source": source, "account": account.0 }));
+    };
+    let parsed: Vec<mailcraft_mime::Mailbox> =
+        mailcraft_mime::addr::parse_mailbox(&address).into_iter().collect();
+    let Some(addr) = parsed.first().map(|m| m.addr.trim().to_owned()).filter(|a| {
+        a.len() <= 320
+            && a.contains('@')
+            && !a.contains(|c: char| c.is_whitespace() || c.is_control() || c == '/')
+    }) else {
+        return Err(CmdError::Params(format!("`{address}` is not an e-mail address")));
+    };
+    if s.mailbox.account(account).is_some_and(|a| a.address.trim().eq_ignore_ascii_case(&addr)) {
+        return Err(CmdError::Params("that is this account's own calendar".into()));
+    }
+    let Some(url) = crate::sync::graph_user_calendar_url(&addr) else {
+        return Err(CmdError::Disabled("Microsoft 365 calendars are not available here".into()));
+    };
+    // Already open: that calendar.
+    let mapped = s.mailbox.account(account).and_then(|a| {
+        a.sync
+            .dav
+            .iter()
+            .find(|(f, st)| st.collection == url && crate::sync::pim::open_calendar_folder(&s.mailbox, **f))
+            .map(|(f, _)| *f)
+    });
+    if let Some(f) = mapped {
+        return Ok(json!({ "folder": f.0, "address": addr, "account": account.0, "existing": true }));
+    }
+    // Calendars closed since (their folder deleted) no longer count; the limit is checked before any folder
+    // is made.
+    prune_shared_calendars(s, account);
+    if s.mailbox
+        .account(account)
+        .is_some_and(|a| a.sync.graph_calendars.len() >= crate::sync::pim::MAX_COLLECTIONS)
+    {
+        return Err(CmdError::Failed("too many shared calendars are open on this account".into()));
+    }
+    let name = opt_name(p)?
+        .or_else(|| contact.as_ref().map(|c| c.full_name()).filter(|n| !n.trim().is_empty()))
+        .or_else(|| parsed.first().and_then(|m| m.name.clone()).filter(|n| !n.trim().is_empty()))
+        .unwrap_or_else(|| addr.clone());
+    let calendar = s
+        .mailbox
+        .role_folder(account, FolderRole::Calendar)
+        .ok_or_else(|| CmdError::Failed("the account has no calendar".into()))?;
+    let parent = crate::sync::pim::shared_calendars(s, account, calendar)
+        .ok_or_else(|| CmdError::Failed("the Shared Calendars folder could not be made".into()))?;
+    let folder = create_calendar(s, parent, &name)?;
+    if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
+        a.sync.graph_calendars.retain(|o| !o.address.eq_ignore_ascii_case(&addr));
+        a.sync
+            .graph_calendars
+            .push(mailcraft_model::account::SharedCalendarRef { address: addr.clone(), name: name.clone() });
+        a.sync.dav.insert(
+            folder,
+            mailcraft_model::account::DavFolderState { collection: url, ..Default::default() },
+        );
+    }
+    // Read-only until the service says the owner lets this user change it.
+    props::update(&mut s.mailbox, folder, |x| x.read_only = true);
+    crate::sync::update_folders(s, account, vec![folder]);
+    Ok(json!({ "folder": folder.0, "address": addr, "account": account.0, "name": name }))
+}
+
+/// Forgets the other people's calendars opened on `account` whose folder is gone or deleted (in Deleted
+/// Items), and the folder states left behind for removed folders.
+fn prune_shared_calendars(s: &mut Session, account: mailcraft_model::AccountId) {
+    let Some(a) = s.mailbox.accounts.iter().find(|a| a.id == account) else { return };
+    let live: std::collections::BTreeSet<String> = a
+        .sync
+        .dav
+        .iter()
+        .filter(|(f, _)| crate::sync::pim::open_calendar_folder(&s.mailbox, **f))
+        .map(|(_, st)| st.collection.clone())
+        .collect();
+    let gone: Vec<FolderId> = a.sync.dav.keys().copied().filter(|f| s.mailbox.folder(*f).is_none()).collect();
+    if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
+        a.sync
+            .graph_calendars
+            .retain(|o| crate::sync::graph_user_calendar_url(&o.address).is_some_and(|u| live.contains(&u)));
+        for f in gone {
+            if a.sync.dav.get(&f).is_some_and(|st| crate::sync::graph_shared_url(&st.collection)) {
+                a.sync.dav.remove(&f);
+            }
+        }
     }
 }
 
@@ -1744,6 +1889,19 @@ fn organizer(s: &Session) -> Option<Address> {
     Some(Address::new(name, account.address.trim()))
 }
 
+/// The organizer address for a new meeting in calendar `folder`: a Microsoft 365 calendar's own account
+/// (the service schedules its meetings in that account's name), else the current account.
+fn organizer_in(s: &Session, folder: FolderId) -> Option<Address> {
+    let Some(account) = graph_scheduled(s, folder).and_then(|a| s.mailbox.account(a)) else {
+        return organizer(s);
+    };
+    if account.address.trim().is_empty() {
+        return organizer(s);
+    }
+    let name = if account.sender_name.trim().is_empty() { None } else { Some(account.sender_name.trim()) };
+    Some(Address::new(name, account.address.trim()))
+}
+
 /// Applies appointment field params to `a` (shared by new and update).
 pub fn apply_appointment_fields(s: &Session, a: &mut Appointment, p: &Value) -> Result<(), CmdError> {
     let tz = s.tz_offset_min;
@@ -2081,7 +2239,7 @@ fn draft_appointment(
         a.is_meeting = true;
     }
     if a.is_meeting && a.organizer.is_none() {
-        a.organizer = organizer(s);
+        a.organizer = organizer_in(s, a.folder);
     }
     Ok(a)
 }
@@ -2192,7 +2350,26 @@ pub fn create_meeting(s: &mut Session, p: &Value) -> CmdResult {
     if mode == SendMode::None {
         return Err(CmdError::Params("a new meeting is sent: `send` must be now|edit".into()));
     }
+    if mode == SendMode::Edit && graph_scheduled(s, folder).is_some() {
+        // The service sends the invitations as soon as the meeting reaches it, and nothing can be reviewed or
+        // discarded after that: the meeting window opens to look it over, and its Send makes it.
+        return open_item_form(s, folder, p, true);
+    }
     let id = create_appointment(s, folder, p, true)?;
+    if let Some(account) = graph_scheduled(s, folder) {
+        // The service sends the invitations once the meeting is on its calendar.
+        crate::sync::update_folders(s, account, vec![folder]);
+        let mut out = s
+            .mailbox
+            .appointments
+            .get(&id)
+            .map_or_else(|| json!({ "id": id.0 }), |a| appointment_summary(s, a));
+        if let Some(o) = out.as_object_mut() {
+            o.insert("sent".into(), json!(true));
+            o.insert("via".into(), json!("service"));
+        }
+        return Ok(out);
+    }
     let compose =
         meeting_compose(s, id).ok_or_else(|| CmdError::Failed("the meeting could not be created".into()))?;
     // Until the invitation goes out, discarding it removes the meeting.
@@ -2220,6 +2397,17 @@ pub fn create_meeting(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     Ok(out)
+}
+
+/// The Microsoft 365 (Graph) account whose service schedules the meetings of calendar `folder`: their
+/// invitations, updates, cancellations and answers go from the service when the calendar is updated, never
+/// as iTIP mail from here.
+pub fn graph_scheduled(s: &Session, folder: FolderId) -> Option<mailcraft_model::AccountId> {
+    let f = s.mailbox.folder(folder)?;
+    let a = s.mailbox.account(f.account)?;
+    (crate::sync::pim::via_graph(a, crate::sync::pim::PimKind::Calendar)
+        && crate::sync::pim::is_synced_folder(&s.mailbox, folder))
+    .then_some(a.id)
 }
 
 /// Sends the invitation of new meeting `id` from compose `compose` straight away (the meeting window's Send).
@@ -2374,7 +2562,7 @@ fn run_update(s: &mut Session, p: &Value) -> CmdResult {
         let Some(mut a) = s.mailbox.appointments.get(id).cloned() else { continue };
         apply_appointment_fields(s, &mut a, p)?;
         if a.is_meeting && a.organizer.is_none() {
-            a.organizer = organizer(s);
+            a.organizer = organizer_in(s, a.folder);
         }
         updated.push(a);
     }
@@ -3826,9 +4014,69 @@ fn run_respond(s: &mut Session, p: &Value) -> CmdResult {
     let response = parse_response(p)?;
     let mode = send_mode(p, SendMode::Now)?;
     let comment = pim::text(p, "comment")?.unwrap_or_default();
+    // A Microsoft 365 (Graph) mailbox answers through the service, which tells the organizer.
+    let graph_account = |s: &Session, item: Option<ItemId>| {
+        s.mailbox
+            .mail
+            .get(mail)
+            .and_then(|m| s.mailbox.folder(m.folder))
+            .and_then(|f| s.mailbox.account(f.account))
+            .filter(|a| crate::sync::pim::via_graph(a, crate::sync::pim::PimKind::Calendar))
+            .map(|a| a.id)
+            .or_else(|| {
+                item.and_then(|i| s.mailbox.appointments.get(&i)).and_then(|a| graph_scheduled(s, a.folder))
+            })
+    };
+    if mode == SendMode::Edit
+        && let Some(account) = graph_account(s, find_by_uid(s, &msg.event.appointment.uid))
+    {
+        // The service sends the answer as soon as it has it: the note for the organizer is written first, and
+        // nothing changes until it is sent (`send: now` with the `comment`).
+        return pim::dialog(
+            s,
+            SERVICE_NOTE_DIALOG,
+            json!({"action": "respond", "id": mail.0, "response": response_name(response),
+                   "subject": msg.event.appointment.subject, "account": account.0, "comment": comment}),
+        );
+    }
     // Here first: when that fails (a read-only calendar, no address to answer from) nothing has reached the
     // organizer or the server, and a retry answers once.
     let (item, answered, me) = apply_response(s, mail, &msg, response)?;
+    let graph = graph_account(s, item);
+    if let Some(account) = graph {
+        let answer = match response {
+            ResponseStatus::Accepted => "accept",
+            ResponseStatus::Tentative => "tentative",
+            ResponseStatus::Declined | ResponseStatus::None => "decline",
+        };
+        let uid = answered.uid.clone();
+        if let Some(a) = s.mailbox.accounts.iter_mut().find(|a| a.id == account) {
+            a.sync.graph_responses.retain(|r| r.uid != uid);
+            if a.sync.graph_responses.len() < 500 {
+                a.sync.graph_responses.push(mailcraft_model::account::GraphResponse {
+                    uid,
+                    response: answer.into(),
+                    comment: comment.chars().take(32 * 1024).collect(),
+                    send: mode != SendMode::None,
+                    mail: mail.0,
+                    attempts: 0,
+                });
+            }
+        }
+        let folders: Vec<FolderId> = crate::sync::pim::synced_folders(&s.mailbox, account)
+            .into_iter()
+            .filter(|(_, k)| *k == crate::sync::pim::PimKind::Calendar)
+            .map(|(f, _)| f)
+            .collect();
+        crate::sync::update_folders(s, account, folders);
+        return Ok(json!({
+            "appointment": item.map(|i| i.0),
+            "response": response_name(response),
+            "compose": Value::Null,
+            "sent": mode != SendMode::None,
+            "via": "service",
+        }));
+    }
     // A request kept on an Exchange server is answered there (the server updates its calendar and tells the
     // organizer); one the server cannot answer gets the usual reply mail.
     let by_server = mode != SendMode::Edit
@@ -3861,6 +4109,54 @@ fn run_respond(s: &mut Session, p: &Value) -> CmdResult {
         "compose": compose,
         "sent": sent,
     }))
+}
+
+/// Dialog id of the note written before a Microsoft 365 calendar's service sends an answer or a cancellation
+/// (`{"action": "respond" | "cancel", "id", "response"?, "subject", "comment"}`): its Send runs the command
+/// again with `send: now` and the note as `comment`; closing it changes nothing.
+pub const SERVICE_NOTE_DIALOG: &str = "serviceMeetingNote";
+
+/// The answer to meeting request `mail` by iCalendar reply mail to its organizer (`response`: accept,
+/// tentative or decline), for a Microsoft 365 account whose service has no event for the meeting. Returns
+/// whether it went.
+pub(crate) fn reply_by_mail(
+    s: &mut Session,
+    mail: ItemId,
+    response: &str,
+    comment: &str,
+) -> Result<bool, CmdError> {
+    let response = parse_response(&json!({ "response": response }))?;
+    if !s.mailbox.mail.contains(mail) {
+        return Err(CmdError::Failed("the invitation message is gone".into()));
+    }
+    let msg =
+        read_itip(s, mail).ok_or_else(|| CmdError::Failed("the invitation message has no meeting".into()))?;
+    let mut a = msg.event.appointment.clone();
+    let me = my_address(s, Some(mail), &a)
+        .ok_or_else(|| CmdError::Failed("there is no account address to answer from".into()))?;
+    set_my_response(&mut a, &me, response);
+    if a.organizer.is_none() {
+        a.organizer = s.mailbox.mail.get(mail).and_then(|m| m.from.clone());
+    }
+    let org = a.organizer.clone().ok_or_else(|| CmdError::Failed("the meeting names no organizer".into()))?;
+    let ics = itip::reply(&a, &me, response, msg.event.sequence, s.now());
+    // From the address the invitation was answered from, so it goes through that account.
+    let compose = ComposeState {
+        to: org.to_display_string(),
+        from: me.to_display_string(),
+        subject: response_subject(response, &a.subject),
+        body: Doc::from_plain_text(comment),
+        attachments: vec![ComposeAttachment {
+            filename: "invite.ics".into(),
+            mime_type: "text/calendar; method=REPLY".into(),
+            data: ics.into_bytes(),
+        }],
+        dirty: true,
+        ..Default::default()
+    };
+    let cid = s.open_compose(compose);
+    let r = s.run("compose.send", &json!({ "compose": cid }))?;
+    Ok(r.get("sent").and_then(Value::as_bool).unwrap_or(false))
 }
 
 /// `calendar.proposeNewTime {id, start, end, response?: tentative|decline, send?, comment?}`: answers the
@@ -4127,6 +4423,11 @@ fn run_accept_proposal(s: &mut Session, p: &Value) -> CmdResult {
         a.end = if ev.end.unix < ev.start.unix { ev.start } else { ev.end };
         a.all_day = ev.all_day;
     }
+    if let Some(account) = s.mailbox.appointments.get(&id).and_then(|a| graph_scheduled(s, a.folder)) {
+        let folder = s.mailbox.appointments.get(&id).map(|a| a.folder);
+        crate::sync::update_folders(s, account, folder.into_iter().collect());
+        return Ok(json!({ "appointment": id.0, "compose": Value::Null, "sent": true, "via": "service" }));
+    }
     let compose = meeting_compose_seq(s, id, update_sequence(s.now()));
     Ok(json!({ "appointment": id.0, "compose": compose }))
 }
@@ -4176,6 +4477,11 @@ fn run_send_update(s: &mut Session, p: &Value) -> CmdResult {
     if mode == SendMode::None {
         return Err(CmdError::Params("`send` must be now|edit".into()));
     }
+    if let Some(account) = graph_scheduled(s, a.folder) {
+        // The service sends the update when the changed meeting reaches it.
+        crate::sync::update_folders(s, account, vec![a.folder]);
+        return Ok(json!({ "id": a.id.0, "sent": true, "via": "service" }));
+    }
     let compose = meeting_compose_seq(s, a.id, update_sequence(s.now()))
         .ok_or_else(|| CmdError::Failed("the update could not be created".into()))?;
     if mode == SendMode::Now {
@@ -4200,6 +4506,40 @@ fn run_cancel_meeting(s: &mut Session, p: &Value) -> CmdResult {
     check_writable(s, a.folder)?;
     let mode = send_mode(p, SendMode::Edit)?;
     let comment = pim::text(p, "comment")?.unwrap_or_default();
+    if let Some(account) = graph_scheduled(s, a.folder) {
+        if mode == SendMode::Edit {
+            // The service sends the cancellations as soon as the meeting leaves its calendar: the note for
+            // the attendees is written first, and the meeting stays until it is sent (`send: now`).
+            return pim::dialog(
+                s,
+                SERVICE_NOTE_DIALOG,
+                json!({"action": "cancel", "id": a.id.0, "subject": a.subject, "account": account.0,
+                       "comment": comment}),
+            );
+        }
+        // Removing the meeting from the service's calendar cancels it for the attendees; a note goes with
+        // the service's cancel action.
+        // (Only for a meeting the service has: one never made there has nobody to tell.)
+        let uid = a.uid.trim().to_owned();
+        if !comment.trim().is_empty()
+            && let Some(remote) = a.remote.as_ref()
+            && let Some(acc) = s.mailbox.accounts.iter_mut().find(|x| x.id == account)
+        {
+            acc.sync.graph_cancels.retain(|c| c.url != remote.url);
+            if acc.sync.graph_cancels.len() < 500 {
+                acc.sync.graph_cancels.push(mailcraft_model::account::GraphCancel {
+                    uid,
+                    url: remote.url.clone(),
+                    comment: comment.chars().take(32 * 1024).collect(),
+                });
+            }
+        }
+        let removed = pim::delete(s, &[a.id]);
+        crate::sync::update_folders(s, account, vec![a.folder]);
+        return Ok(
+            json!({ "removed": pim::ids_json(&removed), "compose": Value::Null, "sent": true, "via": "service" }),
+        );
+    }
     let to = a.attendees.iter().map(|x| x.mailbox.to_display_string()).collect::<Vec<_>>().join("; ");
     let ics = itip::cancel(&a, update_sequence(s.now()), s.now());
     let (compose, sent) =
@@ -4229,7 +4569,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Calendar",
             "Home › Manage Calendars; Folder › Share",
             "",
-            r#"{"source": "internet|file|blank|addressBook|roomList|shared", "name"?: string, "url"?: string (internet), "refreshMin"?: number, "fetch"?: bool, "data"?: "iCalendar text", "path"?: string (file), "parent"?: number} (addressBook/roomList/shared need Exchange: refused)"#,
+            r#"{"source": "internet|file|blank|addressBook|roomList|shared", "name"?: string, "url"?: string (internet), "refreshMin"?: number, "fetch"?: bool, "data"?: "iCalendar text", "path"?: string (file), "parent"?: number, "address"?: string (shared/addressBook), "contact"?: number (addressBook), "account"?: number} (shared/addressBook need a Microsoft 365 account; roomList: refused)"#,
             true,
             run_add_calendar,
         ),
@@ -4957,7 +5297,7 @@ pub(crate) mod tests {
         assert_eq!(folder.parent, Some(cal(&s)));
         let sub = props::read(&s.mailbox, f).subscription.unwrap();
         assert_eq!(sub.url, "http://cal.example.com/holidays.ics");
-        // Other people's, rooms' and shared calendars need Exchange.
+        // Other people's and shared calendars need a Microsoft 365 account; room lists are not read.
         for source in ["shared", "addressBook", "roomList"] {
             let r = s.run(
                 "calendar.addCalendar",
@@ -4970,6 +5310,175 @@ pub(crate) mod tests {
             s.run("calendar.addCalendar", &json!({"source": "internet", "url": "ftp://x"})),
             Err(CmdError::Params(_))
         ));
+    }
+
+    fn graph_account(s: &mut Session) -> mailcraft_model::AccountId {
+        let r = s
+            .run(
+                "accounts.add",
+                &json!({"kind": "graph", "address": "me@example.com",
+                        "incoming": {"host": "https://graph.example.com/v1.0"}}),
+            )
+            .unwrap();
+        mailcraft_model::AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap())
+    }
+
+    #[test]
+    fn closed_shared_calendars_free_their_place_and_the_limit_makes_no_folders() {
+        let mut s = session();
+        s.view.work_offline = true;
+        let a = graph_account(&mut s);
+        let max = crate::sync::pim::MAX_COLLECTIONS;
+        // Opened and closed (deleted, then emptied from Deleted Items) many more times than the limit.
+        for i in 0..max + 5 {
+            let r = s
+                .run(
+                    "calendar.addCalendar",
+                    &json!({"source": "shared", "address": format!("p{i}@example.com")}),
+                )
+                .unwrap_or_else(|e| panic!("{i}: {e}"));
+            let f = r["folder"].as_u64().unwrap();
+            s.selection.folder = FolderId(f);
+            s.run("folder.delete", &json!({"folder": f, "confirm": true})).unwrap();
+            if i % 2 == 0 {
+                s.selection.folder = FolderId(f);
+                s.run("folder.delete", &json!({"folder": f, "confirm": true})).unwrap();
+            }
+        }
+        assert!(s.mailbox.account(a).unwrap().sync.graph_calendars.len() <= 1);
+        // Reopened after its folder was deleted: a new folder.
+        let r =
+            s.run("calendar.addCalendar", &json!({"source": "shared", "address": "p1@example.com"})).unwrap();
+        assert!(r.get("existing").is_none(), "{r}");
+        // At the limit: refused before any folder is made.
+        for i in 1..max {
+            s.run(
+                "calendar.addCalendar",
+                &json!({"source": "shared", "address": format!("q{i}@example.com")}),
+            )
+            .unwrap_or_else(|e| panic!("{i}: {e}"));
+        }
+        assert_eq!(s.mailbox.account(a).unwrap().sync.graph_calendars.len(), max);
+        let folders = s.mailbox.folders.len();
+        let r = s.run("calendar.addCalendar", &json!({"source": "shared", "address": "late@example.com"}));
+        assert!(matches!(r, Err(CmdError::Failed(_))), "{r:?}");
+        assert_eq!(s.mailbox.folders.len(), folders, "no orphan folder");
+    }
+
+    #[test]
+    fn microsoft_365_meetings_to_edit_first_change_nothing_until_sent() {
+        let mut s = session();
+        s.view.work_offline = true;
+        let a = graph_account(&mut s);
+        let cal = s.mailbox.role_folder(a, FolderRole::Calendar).unwrap();
+        let count = |s: &Session| s.mailbox.appointments.values().filter(|x| x.folder == cal).count();
+        // New Meeting to review: the meeting window, nothing saved.
+        let r = s
+            .run(
+                "calendar.newMeeting",
+                &json!({"folder": cal.0, "subject": "Sync", "start": "2027-01-04T10:00", "attendees": "ann@example.com",
+                        "form": false}),
+            )
+            .unwrap();
+        assert_eq!(r["dialog"], MEETING_FORM, "{r}");
+        assert_eq!(count(&s), 0);
+        let r = s
+            .run(
+                "calendar.newMeeting",
+                &json!({"folder": cal.0, "subject": "Sync", "start": "2027-01-04T10:00", "attendees": "ann@example.com",
+                        "form": false, "send": "now"}),
+            )
+            .unwrap();
+        let id = r["id"].as_u64().unwrap();
+        // Made on the Microsoft 365 calendar in that account's name, whichever account is current.
+        assert_eq!(
+            s.mailbox.appointments[&ItemId(id)].organizer.as_ref().map(|o| o.addr.as_str()),
+            Some("me@example.com")
+        );
+        // Cancel Meeting to edit: the note window; the meeting stays.
+        let r =
+            s.run("calendar.cancelMeeting", &json!({"id": id, "send": "edit", "comment": "Sorry"})).unwrap();
+        assert_eq!(r["dialog"], SERVICE_NOTE_DIALOG, "{r}");
+        assert!(s.mailbox.appointments.get(&ItemId(id)).is_some_and(|x| x.folder == cal));
+        assert!(s.composes.is_empty());
+        // Sent with a note: removed here; the note waits only for a meeting the service has.
+        let r =
+            s.run("calendar.cancelMeeting", &json!({"id": id, "send": "now", "comment": "Sorry"})).unwrap();
+        assert_eq!(r["via"], "service");
+        assert!(s.mailbox.appointments.get(&ItemId(id)).is_none_or(|x| x.folder != cal));
+        assert!(s.mailbox.account(a).unwrap().sync.graph_cancels.is_empty(), "never on the service");
+    }
+
+    #[test]
+    fn microsoft_365_accounts_open_other_peoples_calendars_and_let_the_service_schedule() {
+        let mut s = session();
+        s.view.work_offline = true;
+        let r = s
+            .run(
+                "accounts.add",
+                &json!({"kind": "graph", "address": "me@example.com",
+                        "incoming": {"host": "https://graph.example.com/v1.0"}}),
+            )
+            .unwrap();
+        let a = mailcraft_model::AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+        // From Address Book without a person: the window asks; with a contact: that person's calendar.
+        let r = s.run("calendar.addCalendar", &json!({"source": "addressBook"})).unwrap();
+        assert_eq!(r["dialog"], "chooseContact", "{r}");
+        let ann = s
+            .run("people.new", &json!({"firstName": "Ann", "lastName": "Lee", "email": "ann@example.com"}))
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let r = s.run("calendar.addCalendar", &json!({"source": "addressBook", "contact": ann})).unwrap();
+        let f = FolderId(r["folder"].as_u64().unwrap());
+        let folder = s.mailbox.folder(f).unwrap().clone();
+        assert_eq!((folder.name.as_str(), folder.kind), ("Ann Lee", FolderKind::Calendar));
+        let parent = s.mailbox.folder(folder.parent.unwrap()).unwrap();
+        assert_eq!(parent.name, crate::sync::pim::SHARED_CALENDARS);
+        assert!(props::is_read_only(&s.mailbox, f), "read-only until the service says otherwise");
+        let acct = s.mailbox.account(a).unwrap();
+        assert_eq!(acct.sync.graph_calendars.len(), 1);
+        assert!(acct.sync.dav[&f].collection.starts_with("https://graph.invalid/user/"));
+        // Opened again: the same calendar. Junk, the own address and a room list: refused.
+        let again = s
+            .run("calendar.addCalendar", &json!({"source": "shared", "address": "Ann <ann@example.com>"}))
+            .unwrap();
+        assert_eq!((again["folder"].as_u64(), again["existing"].as_bool()), (Some(f.0), Some(true)));
+        for bad in ["me@example.com", "not an address", "a/b@example.com"] {
+            assert!(
+                s.run("calendar.addCalendar", &json!({"source": "shared", "address": bad})).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            s.run("calendar.addCalendar", &json!({"source": "roomList"})),
+            Err(CmdError::Disabled(_))
+        ));
+        // A meeting on the account's calendar sends no invitation mail: the service does.
+        let graph_cal = s.mailbox.role_folder(a, FolderRole::Calendar).unwrap();
+        assert_eq!(graph_scheduled(&s, graph_cal), Some(a));
+        let local = s.mailbox.accounts.iter().find(|x| x.id != a).unwrap().id;
+        let local_cal = s.mailbox.role_folder(local, FolderRole::Calendar).unwrap();
+        assert_eq!(graph_scheduled(&s, local_cal), None, "a local calendar schedules by mail");
+        let r = s
+            .run(
+                "calendar.newMeeting",
+                &json!({"folder": graph_cal.0, "subject": "Sync", "start": "2027-01-04T10:00", "attendees": "ann@example.com",
+                        "form": false, "send": "now"}),
+            )
+            .unwrap();
+        assert_eq!((r["sent"].as_bool(), r["via"].as_str()), (Some(true), Some("service")), "{r}");
+        assert!(s.composes.is_empty(), "no invitation compose");
+        let id = r["id"].as_u64().unwrap();
+        let r = s.run("calendar.sendUpdate", &json!({"id": id, "send": "now"})).unwrap();
+        assert_eq!(r["via"], "service");
+        let r = s.run("calendar.cancelMeeting", &json!({"id": id, "send": "now"})).unwrap();
+        assert_eq!((r["via"].as_str(), r["sent"].as_bool()), (Some("service"), Some(true)));
+        assert!(
+            s.mailbox.appointments.get(&ItemId(id)).is_none_or(|x| x.folder != graph_cal),
+            "off the calendar"
+        );
+        assert!(s.composes.is_empty());
     }
 
     #[test]

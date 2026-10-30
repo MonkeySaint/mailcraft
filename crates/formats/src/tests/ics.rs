@@ -710,3 +710,22 @@ X-ALT-DESC;FMTTYPE=text/plain:not html\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     assert_eq!(j[0].body_html, None);
     assert_eq!(j[0].importance, Importance::Normal);
 }
+
+#[test]
+fn windows_zone_names_map_to_iana_zones() {
+    assert_eq!(tz::iana_of_windows("Pacific Standard Time"), Some("America/Los_Angeles"));
+    assert_eq!(tz::iana_of_windows(" w. europe standard time "), Some("Europe/Berlin"));
+    assert_eq!(tz::iana_of_windows("India Standard Time"), Some("Asia/Kolkata"));
+    assert_eq!(tz::iana_of_windows("Europe/Paris"), Some("Europe/Paris"), "an IANA name stays");
+    assert_eq!(tz::iana_of_windows("UTC"), None);
+    assert_eq!(tz::iana_of_windows("Nowhere Standard Time"), None);
+    assert_eq!(tz::windows_of_iana("America/Toronto"), Some("Eastern Standard Time"));
+    assert_eq!(tz::windows_of_iana("Europe/London"), Some("GMT Standard Time"));
+    assert_eq!(tz::windows_of_iana("Etc/UTC"), None);
+    // A file naming a Windows zone without defining it reads in that zone (DST included).
+    let text = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:w@example.com\r\n\
+DTSTART;TZID=Eastern Standard Time:20260710T090000\r\nDTEND;TZID=Eastern Standard Time:20260710T100000\r\n\
+SUMMARY:Summer\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let a = ics::read_str(text, ImportOptions::default()).unwrap().appointments();
+    assert_eq!(a[0].start.unix, utc(2026, 7, 10, 13, 0).unix);
+}

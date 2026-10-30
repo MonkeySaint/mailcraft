@@ -11,6 +11,10 @@
 //! ([`pim::via_jmap`]); those folders run through the same [`sync_folder`] against a [`jmap_pim::Store`]
 //! (see `jmap_pim.rs`) instead of the WebDAV client ([`PimStore`]).
 //!
+//! **Microsoft Graph.** A Graph account keeps its contacts, calendars and To Do tasks on the service
+//! ([`pim::via_graph`]); those folders run through [`sync_folder`] against a [`graph_pim::Store`], and the
+//! meeting answers waiting for the account go first.
+//!
 //! **Connections.** The DAV servers have their own connection settings (trusted certificate, plain-HTTP
 //! consent) in [`mailcraft_model::DavSettings`]; nothing is taken over from the incoming mail server. An OAuth
 //! account's access token goes only to its provider's own servers; any other DAV server needs a DAV
@@ -32,6 +36,8 @@ use mailcraft_net::{ConnectOptions, NetError};
 use super::Plan;
 use super::ews::EwsConn;
 use super::ews_pim;
+use super::graph::GraphConn;
+use super::graph_pim;
 use super::jmap::JmapConn;
 use super::jmap_pim;
 use super::native::{Event, Events, oauth_provider};
@@ -65,6 +71,8 @@ pub(super) struct DavJob {
     jmap: Option<JmapPimJob>,
     /// Contacts, calendar and tasks kept on the account's Exchange server.
     ews: Option<EwsPimJob>,
+    /// Contacts, calendars and tasks kept on Microsoft Graph.
+    graph: Option<GraphPimJob>,
 }
 
 /// The Exchange part of a [`DavJob`]: which kinds go to the Exchange server, and which to look up first.
@@ -75,6 +83,32 @@ pub(super) struct EwsPimJob {
     discover: BTreeSet<PimKind>,
     tz_offset_min: i32,
     now: mailcraft_model::DateTime,
+}
+
+/// The Microsoft Graph part of a [`DavJob`].
+#[derive(Clone, Debug)]
+pub(super) struct GraphPimJob {
+    conn: GraphConn,
+    /// The account's address and the user's own extra addresses: its own calendars and meetings are the
+    /// ones these own or organize (with the addresses the service knows the user by).
+    me: Vec<String>,
+    discover_contacts: bool,
+    discover_tasks: bool,
+    discover_calendars: bool,
+    /// Other people's calendars opened on the account.
+    opened: Vec<mailcraft_model::account::SharedCalendarRef>,
+    /// Meeting answers waiting to go.
+    responses: Vec<mailcraft_model::account::GraphResponse>,
+    /// Notes for the attendees of meetings cancelled here.
+    cancels: Vec<mailcraft_model::account::GraphCancel>,
+    tz_offset_min: i32,
+    now: mailcraft_model::DateTime,
+}
+
+impl GraphPimJob {
+    fn discovers(&self) -> bool {
+        self.discover_contacts || self.discover_tasks || self.discover_calendars
+    }
 }
 
 /// The JMAP part of a [`DavJob`]: which kinds go to the JMAP server, and whether to list its address books /
@@ -117,6 +151,13 @@ pub(super) trait PimStore {
     -> Result<Vec<Fetched>, NetError>;
     fn list(&self, collection: &str) -> Result<Vec<Resource>, NetError> {
         Ok(self.listing(collection)?.resources)
+    }
+    /// True when an item made here (`data`, its upload body) is not made on the server but kept here only:
+    /// a Microsoft Graph calendar never gets a meeting someone else organized from here (see
+    /// `graph_pim::Store::keeps_local`). Such an item deleted on the server while changed here is removed here
+    /// too instead of going up again.
+    fn keeps_local(&self, _data: &[u8]) -> bool {
+        false
     }
 }
 
@@ -204,6 +245,38 @@ impl PimStore for ews_pim::Store<'_> {
     }
 }
 
+impl PimStore for graph_pim::Store<'_> {
+    fn listing(&self, collection: &str) -> Result<Listing, NetError> {
+        graph_pim::Store::listing(self, collection)
+    }
+    fn put(
+        &self,
+        collection: &str,
+        url: &str,
+        data: &[u8],
+        _content_type: &str,
+        pre: &Precondition,
+    ) -> Result<Option<String>, NetError> {
+        graph_pim::Store::put(self, collection, url, data, pre)
+    }
+    fn delete(&self, url: &str, etag: Option<&str>) -> Result<(), NetError> {
+        // The object's collection is the address without its last segment.
+        let collection = url.trim_end_matches('/').rsplit_once('/').map_or(url, |(c, _)| c);
+        graph_pim::Store::delete(self, &format!("{collection}/"), url, etag)
+    }
+    fn multiget(
+        &self,
+        collection: &str,
+        urls: &[String],
+        _service: Service,
+    ) -> Result<Vec<Fetched>, NetError> {
+        graph_pim::Store::multiget(self, collection, urls)
+    }
+    fn keeps_local(&self, data: &[u8]) -> bool {
+        graph_pim::Store::keeps_local(self, data)
+    }
+}
+
 impl DavJob {
     /// True when the job signs in with the account's OAuth access token on every server it talks to (a
     /// refused sign-in is then worth a renewed token).
@@ -222,6 +295,9 @@ impl DavJob {
         if let Some(e) = self.ews.as_mut() {
             e.conn.set_bearer(token);
         }
+        if let Some(g) = self.graph.as_mut() {
+            g.conn.set_token(token);
+        }
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -232,6 +308,7 @@ impl DavJob {
             && !self.discover_calendars
             && !self.jmap.as_ref().is_some_and(|j| j.discover_contacts || j.discover_calendars)
             && !self.ews.as_ref().is_some_and(|e| !e.discover.is_empty())
+            && !self.graph.as_ref().is_some_and(|g| g.discovers() || !g.responses.is_empty())
     }
 }
 
@@ -367,6 +444,7 @@ pub(super) fn build_job(
     plan: &Plan,
     jmap: Option<&JmapConn>,
     ews: Option<&EwsConn>,
+    graph: Option<&GraphConn>,
 ) -> Option<DavJob> {
     let folders = pim::plan_folders(s, a.id, plan);
     let publish = publish_jobs(s, a.id, plan);
@@ -401,6 +479,40 @@ pub(super) fn build_job(
         tz_offset_min: s.tz_offset_min,
         now: s.now(),
     });
+    let graph = graph.filter(|_| pim::via_graph(a, PimKind::Calendar)).map(|conn| {
+        // Other people's calendars stay opened while a folder holds them (one just added, or kept).
+        let opened = a
+            .sync
+            .graph_calendars
+            .iter()
+            .filter(|o| {
+                let url = graph_pim::Where::User(o.address.trim().to_owned()).url();
+                a.sync
+                    .dav
+                    .iter()
+                    .any(|(f, st)| st.collection == url && pim::open_calendar_folder(&s.mailbox, *f))
+            })
+            .cloned()
+            .collect();
+        // This account's address and the user's own extra addresses (not the other accounts': a meeting one
+        // of those organized would be sent again from this one).
+        let mut me = vec![a.address.trim().to_owned()];
+        me.extend(s.me.iter().map(|m| m.trim().to_owned()));
+        me.retain(|m| !m.is_empty());
+        me.dedup();
+        GraphPimJob {
+            conn: conn.clone(),
+            me,
+            discover_contacts: full || unmapped(PimKind::Contacts),
+            discover_tasks: full || unmapped(PimKind::Tasks),
+            discover_calendars: full || unmapped(PimKind::Calendar),
+            opened,
+            responses: if plan.receive { a.sync.graph_responses.clone() } else { Vec::new() },
+            cancels: a.sync.graph_cancels.clone(),
+            tz_offset_min: s.tz_offset_min,
+            now: s.now(),
+        }
+    });
     if folders.is_empty()
         && publish.is_empty()
         && !discover_contacts
@@ -408,6 +520,7 @@ pub(super) fn build_job(
         && !discover_calendars
         && !jmap.as_ref().is_some_and(|j| j.discover_contacts || j.discover_calendars)
         && !ews.as_ref().is_some_and(|e| !e.discover.is_empty())
+        && !graph.as_ref().is_some_and(|g| g.discovers() || !g.responses.is_empty())
     {
         return None;
     }
@@ -458,6 +571,7 @@ pub(super) fn build_job(
         publish,
         jmap,
         ews,
+        graph,
     })
 }
 
@@ -602,6 +716,109 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &Ar
     let ews: Option<Result<mailcraft_net::ews::EwsClient, NetError>> =
         job.ews.as_ref().map(|e| e.conn.connect());
     let ews_discover = job.ews.as_ref().is_some_and(|e| !e.discover.is_empty());
+    // Microsoft Graph, for the contacts, calendars and tasks kept there.
+    let graph: Option<Result<mailcraft_net::graph::GraphClient, NetError>> = job.graph.as_ref().map(|g| {
+        g.conn.connect(Some(cancel)).map(|mut c| {
+            graph_pim::prepare(&mut c);
+            c
+        })
+    });
+    // Kinds the service did not allow (an account signed in before these permissions were asked for): their
+    // folders wait for a new sign-in.
+    let mut graph_denied: BTreeSet<PimKind> = BTreeSet::new();
+    // The user's own addresses, with those the service knows the user by.
+    let graph_me: Vec<String> = match (job.graph.as_ref(), graph.as_ref()) {
+        (Some(g), Some(Ok(c))) => graph_pim::my_addresses(c, &g.me),
+        (Some(g), _) => g.me.clone(),
+        _ => Vec::new(),
+    };
+    if let (Some(g), Some(c)) = (job.graph.as_ref(), graph.as_ref()) {
+        if !g.responses.is_empty() && !cancelled() {
+            progress("Sending meeting answers…");
+            match c {
+                Ok(c) => {
+                    for (uid, r) in graph_pim::respond_all(c, &g.responses) {
+                        let outcome = match r {
+                            Ok(true) => pim::GraphAnswer::Sent,
+                            Ok(false) => pim::GraphAnswer::NotOnService,
+                            Err(e) if fatal(&e) => return end(&e),
+                            // Passing (and a 404: the event went between the search and the answer): again
+                            // on the next run.
+                            Err(e)
+                                if mailcraft_net::graph::pim::transient(&e)
+                                    || mailcraft_net::graph::pim::not_found(&e) =>
+                            {
+                                pim::GraphAnswer::Retry(failed(&e))
+                            }
+                            Err(e) => pim::GraphAnswer::Refused(failed(&e)),
+                        };
+                        send(PimEvent::GraphResponded { uid, outcome });
+                    }
+                }
+                Err(e) if fatal(e) => return end(e),
+                Err(e) => error = Some(failed(e)),
+            }
+        }
+        if g.discovers() && !cancelled() {
+            progress("Looking for address books, task lists and calendars…");
+            let mut contacts = None;
+            let mut tasks = None;
+            for (kind, wanted, key) in [
+                (PimKind::Contacts, g.discover_contacts, "contacts"),
+                (PimKind::Tasks, g.discover_tasks, "tasks"),
+                (PimKind::Calendar, g.discover_calendars, "calendars"),
+            ] {
+                if !wanted || cancelled() {
+                    continue;
+                }
+                let list = match c {
+                    Ok(c) => graph_pim::collections(c, kind, &graph_me, &g.opened),
+                    Err(e) => Err(e.clone()),
+                };
+                match list {
+                    Ok((l, read_only)) => {
+                        found.insert(key, l.clone());
+                        match kind {
+                            PimKind::Contacts => contacts = Some(l),
+                            PimKind::Tasks => tasks = Some(l),
+                            PimKind::Calendar => {
+                                let listed = l.iter().map(|(u, _)| u.clone()).collect();
+                                send(PimEvent::Collections {
+                                    contacts: None,
+                                    tasks: None,
+                                    calendars: Some(l),
+                                });
+                                send(PimEvent::GraphCalendars { read_only, listed });
+                            }
+                        }
+                    }
+                    Err(e) if mailcraft_net::graph::pim::denied(&e) => {
+                        log::warn!("graph: {} not allowed: {e}", kind.label());
+                        graph_denied.insert(kind);
+                        error.get_or_insert_with(|| {
+                            format!(
+                                "Microsoft 365 did not allow MailCraft to read the {}: sign in to the account again \
+                                 to grant access to contacts, calendars and tasks",
+                                kind.label()
+                            )
+                        });
+                    }
+                    Err(e) if fatal(&e) => return end(&e),
+                    Err(e) => error = Some(format!("{}: {}", kind.label(), failed(&e))),
+                }
+            }
+            if contacts.is_some() || tasks.is_some() {
+                send(PimEvent::Collections { contacts, tasks, calendars: None });
+            }
+        }
+    }
+    // The mailbox's time zone, for appointments made here without one.
+    let graph_zone = match (job.graph.as_ref(), graph.as_ref()) {
+        (Some(_), Some(Ok(c))) if job.folders.iter().any(|f| f.kind == PimKind::Calendar) => {
+            graph_pim::mailbox_zone(c)
+        }
+        _ => None,
+    };
     if job.discover_contacts || job.discover_tasks || job.discover_calendars || jmap_discover || ews_discover
     {
         progress("Looking for address books, task lists and calendars…");
@@ -720,8 +937,12 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &Ar
         };
         let via_jmap = job.jmap.as_ref().is_some_and(|j| j.handles(f.kind));
         let via_ews = job.ews.as_ref().is_some_and(|e| e.kinds.contains(&f.kind));
+        let via_graph = job.graph.is_some();
+        if via_graph && graph_denied.contains(&f.kind) {
+            continue;
+        }
         let collection = match &f.collection {
-            Some(c) if via_jmap || via_ews => Some(c.clone()),
+            Some(c) if via_jmap || via_ews || via_graph => Some(c.clone()),
             // Stored by an earlier version (decoded): the address discovery just found for it, when it ran.
             Some(c) => Some(
                 found
@@ -761,6 +982,28 @@ pub(super) fn run(account: AccountId, job: &DavJob, events: &Events, cancel: &Ar
                 }
                 Some(Err(e)) => Err(e.clone()),
                 None => Err(NetError::Protocol("no Exchange connection".into())),
+            }
+        } else if via_graph {
+            match graph.as_ref() {
+                Some(Ok(c)) => {
+                    let (tz, now) = job
+                        .graph
+                        .as_ref()
+                        .map_or((0, mailcraft_model::DateTime::default()), |g| (g.tz_offset_min, g.now));
+                    let cancels = job.graph.as_ref().map_or(&[][..], |g| &g.cancels[..]);
+                    let store = graph_pim::Store::new(c, f, tz, now, graph_zone.clone(), &graph_me, cancels);
+                    let r = sync_folder(&store, f, &collection).map(|mut out| {
+                        store.finish(&mut out);
+                        out
+                    });
+                    let urls = store.cancelled_urls();
+                    if !urls.is_empty() {
+                        send(PimEvent::GraphCancelled { urls });
+                    }
+                    r
+                }
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(NetError::Protocol("no Microsoft Graph connection".into())),
             }
         } else if via_jmap {
             match jmap.as_ref() {
@@ -1043,6 +1286,12 @@ fn sync_folder(client: &dyn PimStore, job: &FolderJob, collection: &str) -> Resu
                 };
                 // Built here, off the session thread: the merge with the server's copy reads the whole object.
                 let body = item.body();
+                if matches!(pre, Precondition::Create) && complete && client.keeps_local(body.as_bytes()) {
+                    // Gone there (a meeting someone else organized, declined or cancelled there): it is not
+                    // made again, it goes here too.
+                    out.removed.push((item.id, item.fingerprint));
+                    continue;
+                }
                 match put(&url, &body, pre, &mut out)? {
                     Put::Done(etag) => {
                         relist |= etag.is_empty();
@@ -1120,8 +1369,12 @@ fn sync_folder(client: &dyn PimStore, job: &FolderJob, collection: &str) -> Resu
             });
             continue;
         }
-        here.insert(url.clone());
         let body = item.body();
+        if client.keeps_local(body.as_bytes()) {
+            // Kept here only until the server has its own copy (taken over by its UID above, on that run).
+            continue;
+        }
+        here.insert(url.clone());
         match put(&url, &body, Precondition::Create, &mut out)? {
             Put::Done(etag) => {
                 relist |= etag.is_empty();
@@ -1412,6 +1665,7 @@ mod tests {
             folders: Vec::new(),
             jmap: None,
             ews: None,
+            graph: None,
             publish: vec![PublishJob {
                 folder: FolderId(7),
                 url: format!("{base}/p/cal.ics"),
@@ -1451,6 +1705,8 @@ mod tests {
             kind: PimKind::Contacts,
             collection: Some(format!("{base}/c/")),
             known: [(format!("{base}/c/pat.vcf"), "\"1\"".to_owned())].into_iter().collect(),
+            delta: String::new(),
+            delta_at: 0,
             items: vec![pim::LocalItem {
                 id: ItemId(9),
                 remote: Some(mailcraft_model::RemoteRef {
@@ -1490,6 +1746,7 @@ mod tests {
             folders: Vec::new(),
             jmap: None,
             ews: None,
+            graph: None,
             publish: vec![PublishJob {
                 folder: FolderId(7),
                 url: format!("{base}/p/cal.ics"),

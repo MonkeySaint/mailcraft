@@ -70,34 +70,78 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
                 cmd(app, "calendar.changeTimeZone", params).map(|_| None)
             },
         ),
-        "addCalendar" => run_form(
-            ctx,
-            app,
-            d,
-            Form::new(
-                "Add Calendar",
-                vec![
-                    f("source", "From:", combo(&["internet", "file", "blank"])),
-                    f("name", "Name:", Kind::Text),
-                    f("url", "Internet calendar URL:", Kind::Text),
-                    f("path", "iCalendar file (.ics):", Kind::Text),
-                    f(
-                        "n",
-                        "",
-                        Kind::Note(
-                            "An Internet calendar is read-only and is downloaded in the background.".into(),
-                        ),
-                    ),
-                ],
+        "addCalendar" => {
+            // Other people's calendars open on a Microsoft 365 account.
+            let graph_accounts: Vec<(u64, String)> =
+                mailcraft_engine::cmd::calendar::graph_calendar_accounts(&app.s)
+                    .into_iter()
+                    .filter_map(|a| app.s.mailbox.account(a).map(|x| (u64::from(a.0), x.address.clone())))
+                    .collect();
+            let graph = !graph_accounts.is_empty();
+            let sources = if graph {
+                combo(&["internet", "file", "blank", "shared", "addressBook"])
+            } else {
+                combo(&["internet", "file", "blank"])
+            };
+            let mut fields = vec![
+                f("source", "From:", sources),
+                f("name", "Name:", Kind::Text),
+                f("url", "Internet calendar URL:", Kind::Text),
+                f("path", "iCalendar file (.ics):", Kind::Text),
+            ];
+            if graph {
+                fields.push(f("address", "Person's e-mail address (shared):", Kind::Text));
+            }
+            // With more than one Microsoft 365 account: the one the person shared their calendar with.
+            if graph_accounts.len() > 1 {
+                fields.push(f(
+                    "account",
+                    "Open with account:",
+                    Kind::Combo(graph_accounts.iter().map(|(_, a)| a.clone()).collect()),
+                ));
+            }
+            let first_account = d
+                .u64("account")
+                .and_then(|id| graph_accounts.iter().find(|(a, _)| *a == id))
+                .or(graph_accounts.first())
+                .map(|(_, a)| a.clone())
+                .unwrap_or_default();
+            fields.push(f(
+                "n",
+                "",
+                Kind::Note(if graph {
+                    "An Internet calendar is read-only and is downloaded in the background. A person's calendar \
+                     opens below Shared Calendars when they shared it with you on Microsoft 365."
+                        .into()
+                } else {
+                    "An Internet calendar is read-only and is downloaded in the background.".into()
+                }),
+            ));
+            run_form(
+                ctx,
+                app,
+                d,
+                Form::new("Add Calendar", fields)
+                    .init("source", json!(add_calendar_source(&d.str("source"), graph)))
+                    .init("account", json!(first_account))
+                    .width(480.0),
+                move |app, v| {
+                    // Never fetch on the UI thread: the calendar's workers download the feed.
+                    let mut params = json!({"source": v.s("source"), "name": v.s("name"), "url": v.s("url"),
+                                        "path": v.s("path"), "address": v.s("address"), "fetch": false});
+                    let chosen = v.s("account");
+                    if let (Some((id, _)), Some(o)) =
+                        (graph_accounts.iter().find(|(_, a)| *a == chosen), params.as_object_mut())
+                    {
+                        o.insert("account".into(), json!(id));
+                    }
+                    // From Address Book without an address: the person is picked from the contacts next
+                    // (`chooseContact`, opened by the command).
+                    cmd(app, "calendar.addCalendar", params).map(|_| None)
+                },
             )
-            .init("source", json!(add_calendar_source(&d.str("source"))))
-            .width(480.0),
-            |app, v| {
-                // Never fetch on the UI thread: the calendar's workers download the feed.
-                let params = json!({"source": v.s("source"), "name": v.s("name"), "url": v.s("url"), "path": v.s("path"), "fetch": false});
-                cmd(app, "calendar.addCalendar", params).map(|_| None)
-            },
-        ),
+        }
+        mailcraft_engine::cmd::calendar::SERVICE_NOTE_DIALOG => service_meeting_note(ctx, app, d),
         "contactCard" => contact_card(ctx, app, d),
         "chooseContact" => choose_contact(ctx, app, d),
         "forwardContact" => forward_contact(ctx, app, d),
@@ -106,11 +150,59 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
     })
 }
 
-/// The Add Calendar source offered first: the requested one when MailCraft supports it, else Internet.
-fn add_calendar_source(requested: &str) -> &'static str {
+/// The note written before a Microsoft 365 calendar's service sends a meeting answer or cancellation: Send
+/// runs the command with `send: now` and the note; closing the window changes nothing.
+fn service_meeting_note(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
+    let cancel = d.str("action") == "cancel";
+    let id = d.u64("id");
+    let response = d.str("response");
+    let subject = d.str("subject");
+    let (title, note) = if cancel {
+        (
+            "Cancel Meeting",
+            format!(
+                "Microsoft 365 cancels \"{subject}\" and tells the attendees as soon as you choose Send. You \
+                 can add a note for them below; closing this window keeps the meeting."
+            ),
+        )
+    } else {
+        (
+            "Meeting Response",
+            format!(
+                "Microsoft 365 records your answer to \"{subject}\" and tells the organizer as soon as you \
+                 choose Send. You can add a note below; closing this window answers nothing."
+            ),
+        )
+    };
+    let form = Form::new(title, vec![f("n", "", Kind::Note(note)), f("comment", "Note:", Kind::Multi)])
+        .init("comment", json!(d.str("comment")))
+        .ok("Send")
+        .width(480.0);
+    run_form(ctx, app, d, form, move |app, v| {
+        let Some(id) = id else { return Err("The meeting is gone.".into()) };
+        let comment = v.0.get("comment").and_then(Value::as_str).unwrap_or_default().to_owned();
+        if cancel {
+            cmd(app, "calendar.cancelMeeting", json!({"id": id, "send": "now", "comment": comment}))
+                .map(|_| None)
+        } else {
+            cmd(
+                app,
+                "calendar.respond",
+                json!({"id": id, "response": response, "send": "now", "comment": comment}),
+            )
+            .map(|_| None)
+        }
+    })
+}
+
+/// The Add Calendar source offered first: the requested one when MailCraft supports it (a person's calendar
+/// with a Microsoft 365 account, `graph`), else Internet.
+fn add_calendar_source(requested: &str, graph: bool) -> &'static str {
     match requested {
         "file" => "file",
         "blank" => "blank",
+        "shared" if graph => "shared",
+        "addressBook" if graph => "addressBook",
         _ => "internet",
     }
 }
@@ -263,20 +355,47 @@ fn contact_card(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     })
 }
 
+/// Choose a Contact: the contacts that match a name (`text`; a click shows the contact's card), or, with
+/// `pick: "addCalendar"` (Add Calendar › From Address Book), the person whose calendar opens on `account`.
 fn choose_contact(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let ids = d.ids();
+    let calendar = d.str("pick") == "addCalendar";
+    let account = d.u64("account");
     window(ctx, app, d, "Choose a Contact", 380.0, |ui, app| {
-        ui.label(format!("More than one contact matches \"{}\":", d.str("text")));
-        let mut out = Out::Keep;
-        for i in &ids {
-            if let Some(c) = app.s.mailbox.contacts.get(&ItemId(*i))
-                && ui
-                    .button(format!("{}  {}", c.full_name(), c.emails.first().cloned().unwrap_or_default()))
-                    .clicked()
-            {
-                out = Out::close_open("contactCard", json!({"id": i}));
+        if calendar {
+            ui.label("Whose calendar do you want to open?");
+            if ids.is_empty() {
+                muted(ui, app, "None of your contacts has an e-mail address.");
             }
+        } else {
+            ui.label(format!("More than one contact matches \"{}\":", d.str("text")));
         }
+        let mut out = Out::Keep;
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            for i in &ids {
+                if let Some(c) = app.s.mailbox.contacts.get(&ItemId(*i))
+                    && ui
+                        .button(format!(
+                            "{}  {}",
+                            c.full_name(),
+                            c.emails.first().cloned().unwrap_or_default()
+                        ))
+                        .clicked()
+                {
+                    out = if calendar {
+                        let mut p = json!({"source": "addressBook", "contact": i});
+                        if let (Some(a), Some(o)) = (account, p.as_object_mut()) {
+                            o.insert("account".into(), json!(a));
+                        }
+                        // A refusal shows like any other command's.
+                        app.run("calendar.addCalendar", p);
+                        Out::Close
+                    } else {
+                        Out::close_open("contactCard", json!({"id": i}))
+                    };
+                }
+            }
+        });
         out.or(footer(ui, |ui| if btn(ui, "Cancel") { Out::Close } else { Out::Keep }))
     })
 }
@@ -641,11 +760,15 @@ mod tests {
     }
     #[test]
     fn add_calendar_offers_only_supported_sources() {
-        assert_eq!(super::add_calendar_source("file"), "file");
-        assert_eq!(super::add_calendar_source("blank"), "blank");
+        assert_eq!(super::add_calendar_source("file", false), "file");
+        assert_eq!(super::add_calendar_source("blank", true), "blank");
         for other in ["", "internet", "addressBook", "roomList", "shared"] {
-            assert_eq!(super::add_calendar_source(other), "internet");
+            assert_eq!(super::add_calendar_source(other, false), "internet");
         }
+        // With a Microsoft 365 account other people's calendars open too; room lists still do not.
+        assert_eq!(super::add_calendar_source("shared", true), "shared");
+        assert_eq!(super::add_calendar_source("addressBook", true), "addressBook");
+        assert_eq!(super::add_calendar_source("roomList", true), "internet");
     }
 }
 

@@ -760,6 +760,25 @@ pub(crate) fn send_now(s: &mut Session, account: AccountId) {
     refresh_status(s);
 }
 
+/// Updates `folders` of `account` soon (a meeting made, changed or answered on a Microsoft 365 calendar goes to
+/// the service, which sends the invitations). Problems only show in the status.
+pub(crate) fn update_folders(s: &mut Session, account: AccountId, folders: Vec<FolderId>) {
+    if s.view.work_offline || folders.is_empty() {
+        return;
+    }
+    if s.mailbox.account(account).is_none_or(|a| !is_server_account(a.kind)) {
+        return;
+    }
+    let plan = Plan { send: false, receive: true, folders: Some(folders), user: false };
+    if let Err(e) = dispatch(s, account, plan) {
+        let until = s.now().unix.saturating_add(BLOCKED_RETRY_SECS);
+        let run = s.sync.runs.entry(account).or_default();
+        run.error = Some(e);
+        run.blocked_until = until;
+    }
+    refresh_status(s);
+}
+
 /// Drops the worker and runtime state of a removed account.
 pub(crate) fn forget_account(s: &mut Session, id: AccountId) {
     s.sync.runs.remove(&id);
@@ -2054,6 +2073,10 @@ mod ews_pim;
 pub mod focus;
 #[cfg(not(target_arch = "wasm32"))]
 mod graph;
+#[cfg(not(target_arch = "wasm32"))]
+mod graph_items;
+#[cfg(not(target_arch = "wasm32"))]
+mod graph_pim;
 pub mod groups;
 #[cfg(not(target_arch = "wasm32"))]
 mod jmap;
@@ -2068,6 +2091,34 @@ mod native;
 pub mod older;
 pub mod pim;
 pub mod shared;
+
+/// The store address of `address`'s default calendar opened on a Microsoft Graph account (`None` where
+/// Graph is not available).
+pub(crate) fn graph_user_calendar_url(address: &str) -> Option<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(graph_pim::Where::User(address.trim().to_owned()).url())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = address;
+        None
+    }
+}
+
+/// True for the address of another person's calendar on a Microsoft Graph account (it goes below Shared
+/// Calendars).
+pub(crate) fn graph_shared_url(url: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        graph_pim::is_shared_url(url)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = url;
+        false
+    }
+}
 
 // =======================================================================================================
 // OAuth sign-in
@@ -2439,7 +2490,7 @@ fn discovery_json(d: &mailcraft_net::discover::Discovery) -> Value {
         "ews": d.ews.as_ref().map(|e| json!({"url": e.url, "autodiscover": e.autodiscover,
             "needsSignIn": e.needs_sign_in, "verified": e.verified})),
         // A well-known provider (Microsoft 365, Outlook.com, Google): its OAuth provider, hints for the
-        // settings page, and whether a Microsoft Graph account kind could serve it (graph-mail, issue #4).
+        // settings page, and whether a Microsoft 365 (Graph) account can serve it.
         "provider": d.provider.map(|m| json!({
             "id": m.provider.key,
             "name": m.provider.name,

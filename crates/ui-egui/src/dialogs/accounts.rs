@@ -740,7 +740,8 @@ fn graph_notes(provider: &str) -> Vec<String> {
     let mut v = vec![
         "Microsoft Graph reads and sends this mailbox over HTTPS: IMAP, POP and SMTP do not have to be turned on."
             .to_owned(),
-        "The app you registered needs the Microsoft Graph permissions Mail.ReadWrite, Mail.Send and offline_access."
+        "The app you registered needs the Microsoft Graph permissions Mail.ReadWrite, Mail.Send, Contacts.ReadWrite, \
+         Calendars.ReadWrite, Calendars.ReadWrite.Shared, Tasks.ReadWrite, MailboxSettings.Read and offline_access."
             .to_owned(),
     ];
     if provider == "microsoft365" {
@@ -2494,6 +2495,42 @@ mod tests {
         after_lookup(&mut w);
         assert!(!w.graph);
         assert_eq!(w.in_host, "imap.example.org");
+    }
+
+    #[test]
+    fn microsoft_365_and_exchange_are_separate_account_types() {
+        // Integration of the Graph and Exchange account kinds: a lookup that finds both a Microsoft 365
+        // provider and an Autodiscover answer starts as Microsoft 365, and either type sends only its own kind.
+        let mut w = wizard("kim@both.example.com");
+        w.take_discovery(json!({
+            "found": true, "sources": ["mx", "autodiscover"],
+            "imap": server("outlook.office365.com", 993, "tls", true, true),
+            "smtp": server("smtp.office365.com", 587, "starttls", true, true),
+            "ews": {"url": "https://ews.both.example.com/EWS/Exchange.asmx", "needsSignIn": false,
+                    "verified": true},
+            "provider": {"id": "microsoft365", "name": "Microsoft 365", "detectedBy": "mx",
+                         "oauthProvider": "microsoft", "graph": true, "notes": []},
+        }));
+        after_lookup(&mut w);
+        assert!(w.graph && !w.ews && !w.jmap && !w.pop3);
+        assert!(w.url_only(), "no SMTP server for a Graph account");
+        assert_eq!(w.kind_name(), "Microsoft 365");
+        let p = w.params(None);
+        assert_eq!(p["kind"], "graph");
+        assert!(p.get("autodiscover").is_none() && p.get("outgoing").is_none(), "{p}");
+        // Exchange chosen on the account type page instead: the EWS address the lookup found, kind exchange.
+        w.graph = false;
+        w.ews = true;
+        w.guess();
+        assert!(w.url_only());
+        assert_eq!(w.kind_name(), "Exchange");
+        assert_eq!(w.in_host, "https://ews.both.example.com/EWS/Exchange.asmx");
+        w.password = "pw".into();
+        assert!(w.settings_ok());
+        let p = w.params(None);
+        assert_eq!(p["kind"], "exchange");
+        assert_eq!(p["incoming"]["host"], "https://ews.both.example.com/EWS/Exchange.asmx");
+        assert!(p.get("outgoing").is_none(), "{p}");
     }
 
     #[test]

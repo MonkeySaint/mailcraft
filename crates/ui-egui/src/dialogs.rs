@@ -396,6 +396,7 @@ pub const KNOWN: &[&str] = &[
     "addCalendar",
     "contactCard",
     "chooseContact",
+    "serviceMeetingNote",
 ];
 
 fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {

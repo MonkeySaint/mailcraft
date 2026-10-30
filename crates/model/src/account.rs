@@ -211,6 +211,69 @@ pub struct DavFolderState {
     pub collection: String,
     /// Resource URL → ETag as of the last synchronisation (tells deletions here from additions there).
     pub known: std::collections::BTreeMap<String, String>,
+    /// Microsoft Graph: the delta link the next run continues from (empty: list the collection whole).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub delta: String,
+    /// When that delta link was made by listing the collection whole (Unix seconds; a calendar is listed
+    /// whole again after a while, as its delta covers a range of dates).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub delta_at: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
+/// A meeting answer waiting to go to a Microsoft Graph account's service (the event's `accept`,
+/// `tentativelyAccept` or `decline` action, which also tells the organizer).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GraphResponse {
+    /// iCalendar UID of the meeting.
+    pub uid: String,
+    /// `accept`, `tentative` or `decline`.
+    pub response: String,
+    pub comment: String,
+    /// Tell the organizer.
+    pub send: bool,
+    /// The invitation message answered (its item id; 0: none). When the service has no event for the
+    /// meeting, the answer goes to the organizer as an iCalendar reply to this message instead.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub mail: u64,
+    /// Runs that could not send the answer for a passing reason (the network, the service busy).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub attempts: u32,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// A meeting the user cancelled with a note for the attendees on a Microsoft Graph calendar: its removal
+/// goes to the service as the event's `cancel` action carrying the note (the service sends the
+/// cancellations).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GraphCancel {
+    /// iCalendar UID of the meeting here.
+    pub uid: String,
+    /// The meeting's address on the service (its store address, as in its `RemoteRef`).
+    pub url: String,
+    pub comment: String,
+}
+
+/// Another person's calendar opened on a Microsoft Graph account (Add Calendar › Open Shared Calendar or
+/// From Address Book): their default calendar, `/users/{address}/calendar`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SharedCalendarRef {
+    pub address: String,
+    /// Shown as the calendar's name.
+    pub name: String,
 }
 
 impl Account {
@@ -401,4 +464,13 @@ pub struct AccountSync {
     /// A JMAP account's server offers calendars over JMAP (JMAP for Calendars).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub jmap_calendars: bool,
+    /// Microsoft Graph: meeting answers waiting to go to the service, oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub graph_responses: Vec<GraphResponse>,
+    /// Microsoft Graph: other people's calendars opened on this account.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub graph_calendars: Vec<SharedCalendarRef>,
+    /// Microsoft Graph: notes for the attendees of meetings cancelled here, until the cancellation went.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub graph_cancels: Vec<GraphCancel>,
 }

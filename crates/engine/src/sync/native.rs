@@ -905,7 +905,11 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         Incoming::Ews(c) => Some(c),
         _ => None,
     };
-    let dav = super::dav::build_job(s, &a, &plan, jmap_conn, ews_conn).filter(|j| !j.is_empty());
+    let graph_conn = match &conn.incoming {
+        Incoming::Graph(c) => Some(c),
+        _ => None,
+    };
+    let dav = super::dav::build_job(s, &a, &plan, jmap_conn, ews_conn, graph_conn).filter(|j| !j.is_empty());
     let full_plan = plan;
     let plan = super::dav::mail_only(s, id, &full_plan);
     let outgoing = outgoing_items(s, &a, &plan, now);

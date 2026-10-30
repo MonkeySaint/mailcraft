@@ -255,3 +255,51 @@ fn large_attachments_go_through_an_upload_session() {
     assert_eq!(seen[2].body.len(), 1000);
     t.join().unwrap();
 }
+
+#[test]
+fn delta_rounds_read_to_the_delta_link_and_send_extra_preferences() {
+    let (base, t, rx) = serve(3, |req| {
+        let host = req.header("host").unwrap().to_owned();
+        if req.path.contains("page=2") {
+            reply(
+                200,
+                &format!(
+                    r#"{{"value": [{{"id": "c", "@removed": {{"reason": "deleted"}}}}, {{"x": 1}}], "@odata.deltaLink": "http://{host}/v1.0/me/contactFolders/f/contacts/delta?$deltatoken=7"}}"#
+                ),
+            )
+        } else if req.path.contains("elsewhere") {
+            reply(200, r#"{"value": [], "@odata.deltaLink": "https://other.example.com/v1.0/delta"}"#)
+        } else {
+            reply(
+                200,
+                &format!(
+                    r#"{{"value": [{{"id": "a", "givenName": "Pat"}}, {{"id": "b"}}], "@odata.nextLink": "http://{host}/v1.0/me/contactFolders/f/contacts/delta?page=2"}}"#
+                ),
+            )
+        }
+    });
+    let mut c = client(&base);
+    c.prefer.push("outlook.timezone=\"UTC\"".into());
+    c.prefer.push("bad\r\nInjected: 1".into());
+    let r = pim::delta_round(&c, "/me/contactFolders/f/contacts/delta", 100).unwrap();
+    assert_eq!(r.changed.len(), 2);
+    assert_eq!(r.removed, vec!["c".to_owned()]);
+    assert!(r.delta_link.ends_with("$deltatoken=7"), "{}", r.delta_link);
+    // A delta link to another server is refused, never followed with the token.
+    assert!(pim::delta_round(&c, "/me/elsewhere/delta", 100).is_err());
+    t.join().unwrap();
+    let first = rx.recv().unwrap();
+    let prefer = first.header("prefer").unwrap_or_default().to_owned();
+    assert!(prefer.contains("outlook.timezone=\"UTC\""), "{prefer}");
+    assert!(!prefer.contains("Injected"), "{prefer}");
+
+    // More changes than asked for: an error, not a partial round.
+    let (base, t, _rx) = serve(1, |_| {
+        reply(
+            200,
+            r#"{"value": [{"id": "a"}, {"id": "b"}, {"id": "c"}], "@odata.deltaLink": "http://127.0.0.1/x"}"#,
+        )
+    });
+    assert!(pim::delta_round(&client(&base), "/me/todo/lists/l/tasks/delta", 2).is_err());
+    t.join().unwrap();
+}

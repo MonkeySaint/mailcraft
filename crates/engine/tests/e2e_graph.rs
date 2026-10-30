@@ -360,6 +360,12 @@ fn graph_oauth_sign_in_uses_graph_scopes_and_renews_a_refused_token() {
     );
     let url = v["authUrl"].as_str().unwrap();
     assert!(url.contains("graph.microsoft.com%2FMail.ReadWrite") && url.contains("Mail.Send"), "{url}");
+    // Contacts, calendars (shared ones too), To Do tasks and the mailbox's time zone.
+    for scope in
+        ["Contacts.ReadWrite", "Calendars.ReadWrite.Shared", "Tasks.ReadWrite", "MailboxSettings.Read"]
+    {
+        assert!(url.contains(scope), "{scope}: {url}");
+    }
     assert!(!url.contains("IMAP.AccessAsUser"), "{url}");
     run(&mut s, "accounts.oauthCancel", json!({"account": a.0}));
 

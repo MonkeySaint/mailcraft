@@ -1629,3 +1629,68 @@ fn import_export_wizard_imports_a_pst_file_and_shows_its_progress_and_report() {
     assert!(names(&h).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The sample session with a Microsoft 365 account (offline: nothing is sent anywhere).
+fn graph_app() -> (App, mailcraft_model::AccountId) {
+    let mut app = sample_app();
+    app.s.view.work_offline = true;
+    let r = app
+        .run(
+            "accounts.add",
+            json!({"kind": "graph", "address": "me@example.com", "incoming": {"host": "https://graph.example.com/v1.0"}}),
+        )
+        .unwrap();
+    let a = mailcraft_model::AccountId(u32::try_from(r["account"].as_u64().unwrap()).unwrap());
+    (app, a)
+}
+
+#[test]
+fn from_address_book_picks_the_person_whose_calendar_opens() {
+    let (mut app, a) = graph_app();
+    app.run("people.new", json!({"firstName": "Ann", "lastName": "Lee", "email": "ann@example.com"}))
+        .unwrap();
+    app.run("calendar.addCalendar", json!({"source": "addressBook"})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["chooseContact"]);
+    h.get_by_label("Ann Lee  ann@example.com").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", names(&h));
+    let s = &h.state().s;
+    let folder =
+        s.mailbox.folders.values().find(|f| f.account == a && f.name == "Ann Lee").expect("her calendar");
+    let parent = folder.parent.and_then(|p| s.mailbox.folder(p)).unwrap();
+    assert_eq!(parent.name, "Shared Calendars");
+    assert_eq!(s.mailbox.account(a).unwrap().sync.graph_calendars[0].address, "ann@example.com");
+}
+
+#[test]
+fn cancel_meeting_on_a_microsoft_365_calendar_asks_for_the_note_first() {
+    let (mut app, a) = graph_app();
+    let cal = app.s.mailbox.role_folder(a, mailcraft_model::FolderRole::Calendar).unwrap();
+    let r = app
+        .run(
+            "calendar.newMeeting",
+            json!({"folder": cal.0, "subject": "Sync", "start": "2027-01-04T10:00", "attendees": "ann@example.com",
+                   "form": false, "send": "now"}),
+        )
+        .unwrap();
+    let id = ItemId(r["id"].as_u64().unwrap());
+    app.run("calendar.cancelMeeting", json!({"id": id.0, "send": "edit"})).unwrap();
+    let mut h = harness(app);
+    assert_eq!(names(&h), ["serviceMeetingNote"]);
+    // Closed: the meeting stays.
+    h.get_by_label("Cancel").click();
+    step(&mut h);
+    assert!(names(&h).is_empty());
+    assert!(h.state().s.mailbox.appointments.get(&id).is_some_and(|x| x.folder == cal));
+    // Sent: the meeting goes.
+    h.state_mut().run("calendar.cancelMeeting", json!({"id": id.0, "send": "edit"})).unwrap();
+    step(&mut h);
+    assert_eq!(names(&h), ["serviceMeetingNote"]);
+    h.get_by_role(egui::accesskit::Role::MultilineTextInput).type_text("Moved to Friday");
+    step(&mut h);
+    h.get_by_label("Send").click();
+    step(&mut h);
+    assert!(names(&h).is_empty(), "{:?}", names(&h));
+    assert!(h.state().s.mailbox.appointments.get(&id).is_none_or(|x| x.folder != cal));
+}

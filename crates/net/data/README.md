@@ -30,7 +30,10 @@ Notes on the listed providers (from their public documentation):
   finds from the domain); `offline_access` is needed for refresh tokens. A **Microsoft 365 (Graph)** account
   signs in with the same provider but asks for Microsoft Graph's delegated scopes instead of the scopes listed
   in `oauth-providers.json` (`mailcraft_net::graph::MAIL_SCOPES`): `https://graph.microsoft.com/Mail.ReadWrite`,
-  `https://graph.microsoft.com/Mail.Send` and `offline_access`. One access token serves one resource, so a
+  `https://graph.microsoft.com/Mail.Send` and `offline_access`, plus `Contacts.ReadWrite`,
+  `Calendars.ReadWrite`, `Calendars.ReadWrite.Shared`, `Tasks.ReadWrite` and `MailboxSettings.Read` for
+  contacts, calendars, To Do tasks and the mailbox's time zone (`mailcraft_net::graph::pim::PIM_SCOPES`). One
+  access token serves one resource, so a
   Graph account's token never signs in to IMAP or SMTP, and the other way round.
 
 ## Registering a client id, step by step
@@ -70,9 +73,9 @@ it as one:
 3. Authentication › **Allow public client flows: Yes** (needed for the device code flow).
 4. API permissions: `IMAP.AccessAsUser.All`, `POP.AccessAsUser.All`, `SMTP.Send` (Office 365 Exchange
    Online) and `offline_access` for IMAP, POP and SMTP accounts; for **Microsoft 365 (Graph)** accounts,
-   Microsoft Graph › Delegated permissions › `Mail.ReadWrite`, `Mail.Send` and `offline_access` (calendars,
-   contacts and tasks over Graph add their own). One registration can carry both sets. No client secret is
-   needed.
+   Microsoft Graph › Delegated permissions › `Mail.ReadWrite`, `Mail.Send`, `Contacts.ReadWrite`,
+   `Calendars.ReadWrite`, `Calendars.ReadWrite.Shared`, `Tasks.ReadWrite`, `MailboxSettings.Read` and
+   `offline_access`. One registration can carry both sets. No client secret is needed.
 5. Supported account types: a registration for your own organization only (*single tenant*) is fine. Account
    setup finds the organization's tenant id from its domain and signs in at
    `https://login.microsoftonline.com/<tenant>/…` instead of `common` (`"tenant"` in `accounts.oauthSignIn`).

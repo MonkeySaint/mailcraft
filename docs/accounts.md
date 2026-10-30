@@ -167,8 +167,11 @@ Graph account the sign-in asks for Graph's delegated permissions instead of the 
 serves one service).
 
 **Permissions to grant** in the Microsoft Entra app registration (API permissions › Microsoft Graph ›
-Delegated): `Mail.ReadWrite` (read and change mail and folders), `Mail.Send` (send as the user) and
-`offline_access` (a refresh token). Calendars, contacts and tasks over Graph add their own permissions. An
+Delegated): `Mail.ReadWrite` (read and change mail and folders), `Mail.Send` (send as the user),
+`Contacts.ReadWrite` (contacts), `Calendars.ReadWrite` (calendars), `Calendars.ReadWrite.Shared` (calendars
+other people share with the user), `Tasks.ReadWrite` (Microsoft To Do), `MailboxSettings.Read` (the mailbox's
+time zone) and `offline_access` (a refresh token). An account signed in before the contacts, calendar and
+task permissions were asked for keeps its mail working and says so for the rest until it signs in again. An
 organization that does not let users consent to apps needs an administrator's consent once. IMAP, POP and
 Authenticated SMTP do not have to be turned on for the mailbox.
 
@@ -205,13 +208,64 @@ Authenticated SMTP do not have to be turned on for the mailbox.
   Other still wins.
 - **Push.** Graph notifies only public web endpoints, so a Graph account with push on has its Inbox polled
   every `pollMinutes` instead (**Polling**).
+- **Contacts.** The default contacts folder is the account's Contacts; each contact folder below it, at any
+  depth down to five levels, gets a Contacts folder of its own. Names, e-mail addresses (three), the
+  business, home and mobile numbers, addresses, company, department, job title, web page, IM address,
+  birthday, notes, categories, nickname, spouse, office, profession, manager and assistant go both ways.
+  Graph keeps no fax, pager or other numbers, no second mobile number and no anniversary: those stay here, also
+  when the contact changes on the service (pictures are not synchronised).
+- **Calendars.** The default calendar is the account's Calendar, the user's other calendars get folders of
+  their own, and calendars other people share with the user go below a **Shared Calendars** folder (read-only
+  there when the owner lets the user only read them). **Add Calendar › Open Shared Calendar** (an address) and
+  **From Address Book** (a contact) open another person's calendar there too (`calendar.addCalendar
+  {"source": "shared", "address"}` / `{"source": "addressBook", "contact"}`), when they shared it on the
+  service; room lists are not read. With more than one Microsoft 365 account the Add Calendar window asks
+  which one opens it; From Address Book offers the contacts with an e-mail address. A shared calendar closes
+  when its folder is deleted. The user's own calendars are told by the service (the default calendar, the
+  ones only their owner may share, and those owned by the address the service knows the user by), so an
+  account signed in with an alias still has its own Calendar. Events keep their time zone (Graph's Windows
+  zone names are read as the IANA zones MailCraft knows), all-day days (the days they have in the zone they
+  were made in, wherever the user is), reminders, show as, categories, privacy, importance and attendees
+  with their answers; a recurring series keeps its pattern and range, its exceptions (an occurrence changed
+  on either side) and its cancelled occurrences (exception dates; inferred only for a series in a zone
+  MailCraft knows, so an organizer's custom zone never turns occurrences into exception dates). An
+  appointment made here without a zone of its own, all-day ones included, is written in the mailbox's time
+  zone.
+- **Meetings.** The service schedules the meetings of a Microsoft 365 calendar: a meeting made, changed or
+  cancelled here goes to the service on the next update (started right away), and the service sends the
+  invitations, updates and cancellations; Accept, Tentative and Decline on an invitation answer through the
+  event's actions, which tell the organizer (no iTIP mail goes from MailCraft). Invitations the service put
+  on the calendar are not doubled by the ones placed from their mail. Because the service sends as soon as
+  it has the change, **Edit the response before sending** and **Cancel Meeting** first open a note to write
+  (the answer or cancellation goes with it on Send; closing the note changes nothing), and a new meeting to
+  review opens the meeting window instead of a compose. An answer that cannot go for a passing reason (the
+  network, the service busy) is tried again on the next update; one for a meeting the service does not have
+  goes to the organizer as an iCalendar reply by mail instead. A meeting someone else organized is never made
+  on the service from here (it would invite its attendees in the user's name): copied or imported into a
+  Microsoft 365 calendar, or placed from an invitation the service has not put on its calendar, it stays
+  here until the service has its own copy, and one declined or removed there while changed here goes here
+  too.
+- **Tasks.** Microsoft To Do lists: the default list is the account's Tasks, the other lists get Tasks
+  folders of their own (the service's own Flagged email list is not one). Subject, notes, importance, status,
+  start and due days, completion, the reminder, categories and recurrence go both ways; To Do keeps no
+  percentage complete, so the one here stays while the status does.
+- **Delta.** Contacts, calendars and task lists are read with delta queries like the mail: an update reads
+  only what changed since the last one and lists the rest as it was; a delta state the service no longer
+  knows lists the folder whole again. A calendar's delta covers its calendar view from a year back to two
+  years ahead, so it is also listed whole once a week (the first round of such a listing keeps only its delta
+  link, not the events it lists); a changed occurrence re-reads its series, and a removed occurrence that
+  names no series re-reads only the series whose master changed (more than 200 series: the calendar is
+  listed whole on the next update). Changed here
+  and changed there: the copy here wins on the next update (as with CardDAV / CalDAV), and only the
+  properties changed here are written.
 - Limits today: no server search (Include Older Results), no offline window, uploaded messages are drafts on
   the service, and Save Sent Item To has no effect (the service files the copy in Sent Items).
 
 The local test servers include a fake Graph mail service (`TestServers::graph_url`) on the same mail as their
 IMAP, POP3 and JMAP servers, with paging, delta links, `$value`, `sendMail`, upload sessions, flag dates, and
-throttling or refused upload sessions on demand; `crates/engine/tests/e2e_graph.rs` runs a Graph account against it end to end, and never against a
-Microsoft service.
+throttling or refused upload sessions on demand, plus contact folders, calendars (series, exceptions, calendar
+view deltas, shared calendars, scheduling and answers) and To Do lists; `crates/engine/tests/e2e_graph.rs` and
+`e2e_graph_pim.rs` run a Graph account against it end to end, and never against a Microsoft service.
 
 ## Exchange (EWS)
 

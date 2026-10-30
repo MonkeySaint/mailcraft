@@ -495,8 +495,7 @@ pub fn builtin(tzid: &str) -> Option<TimeZone> {
     if let Some(off) = fixed_from_name(name) {
         return Some(TimeZone::fixed(tzid, off));
     }
-    let (_, std, dst) =
-        BUILTIN.iter().find(|(names, _, _)| names.iter().any(|n| n.eq_ignore_ascii_case(name)))?;
+    let (_, std, dst) = builtin_row(name)?;
     let std = *std;
     let day = std + 60;
     // Onsets from 2007 (the current North American rules); earlier dates use the first observance's offsets.
@@ -549,7 +548,19 @@ pub fn builtin_name(tzid: &str) -> Option<&'static str> {
     if fixed_from_name(name).is_some() {
         return None;
     }
-    BUILTIN.iter().flat_map(|(names, _, _)| names.iter()).find(|n| n.eq_ignore_ascii_case(name)).copied()
+    let (names, _, _) = builtin_row(name)?;
+    // A Windows name stands for the first IANA name of its row; an IANA name keeps its own spelling.
+    names.iter().find(|n| n.eq_ignore_ascii_case(name)).or_else(|| names.first()).copied()
+}
+
+/// The built-in table row of an IANA name or alias, or of a Windows zone name ([`WINDOWS_ZONES`]).
+fn builtin_row(name: &str) -> Option<&'static (&'static [&'static str], i32, Dst)> {
+    let by_iana =
+        |n: &str| BUILTIN.iter().find(|(names, _, _)| names.iter().any(|x| x.eq_ignore_ascii_case(n)));
+    by_iana(name).or_else(|| {
+        let iana = WINDOWS_ZONES.iter().find(|(w, _)| w.eq_ignore_ascii_case(name)).map(|(_, i)| *i)?;
+        by_iana(iana)
+    })
 }
 
 /// The built-in zone that keeps the same offsets as `zone` (a file's own VTIMEZONE, such as one named
@@ -575,6 +586,90 @@ pub fn equivalent_builtin(zone: &TimeZone, year: i64) -> Option<&'static str> {
             days.iter().zip(&offsets).all(|(&u, &off)| theirs.offset_at_utc(u) == off).then_some(*name)
         },
     )
+}
+
+/// Windows time zone names (as Exchange and Microsoft Graph spell an event's zone) and the IANA zone each
+/// stands for in its main territory, from the Unicode CLDR `windowsZones` mapping (public data). Only zones
+/// whose IANA name is in the built-in table are listed.
+const WINDOWS_ZONES: &[(&str, &str)] = &[
+    ("Eastern Standard Time", "America/New_York"),
+    ("US Eastern Standard Time", "America/New_York"),
+    ("Central Standard Time", "America/Chicago"),
+    ("Mountain Standard Time", "America/Denver"),
+    ("US Mountain Standard Time", "America/Phoenix"),
+    ("Pacific Standard Time", "America/Los_Angeles"),
+    ("Pacific Standard Time (Mexico)", "America/Tijuana"),
+    ("Alaskan Standard Time", "America/Anchorage"),
+    ("Hawaiian Standard Time", "Pacific/Honolulu"),
+    ("Atlantic Standard Time", "America/Halifax"),
+    ("Newfoundland Standard Time", "America/St_Johns"),
+    ("Canada Central Standard Time", "America/Regina"),
+    ("Central Standard Time (Mexico)", "America/Mexico_City"),
+    ("Central America Standard Time", "America/Guatemala"),
+    ("SA Pacific Standard Time", "America/Bogota"),
+    ("SA Western Standard Time", "America/La_Paz"),
+    ("Venezuela Standard Time", "America/Caracas"),
+    ("E. South America Standard Time", "America/Sao_Paulo"),
+    ("Argentina Standard Time", "America/Buenos_Aires"),
+    ("Montevideo Standard Time", "America/Montevideo"),
+    ("Greenwich Standard Time", "Atlantic/Reykjavik"),
+    ("GMT Standard Time", "Europe/London"),
+    ("W. Europe Standard Time", "Europe/Berlin"),
+    ("Romance Standard Time", "Europe/Paris"),
+    ("Central Europe Standard Time", "Europe/Budapest"),
+    ("Central European Standard Time", "Europe/Warsaw"),
+    ("W. Central Africa Standard Time", "Africa/Lagos"),
+    ("GTB Standard Time", "Europe/Bucharest"),
+    ("FLE Standard Time", "Europe/Kiev"),
+    ("South Africa Standard Time", "Africa/Johannesburg"),
+    ("Egypt Standard Time", "Africa/Cairo"),
+    ("Russian Standard Time", "Europe/Moscow"),
+    ("Turkey Standard Time", "Europe/Istanbul"),
+    ("Belarus Standard Time", "Europe/Minsk"),
+    ("Arab Standard Time", "Asia/Riyadh"),
+    ("E. Africa Standard Time", "Africa/Nairobi"),
+    ("Arabian Standard Time", "Asia/Dubai"),
+    ("Azerbaijan Standard Time", "Asia/Baku"),
+    ("Georgian Standard Time", "Asia/Tbilisi"),
+    ("Pakistan Standard Time", "Asia/Karachi"),
+    ("West Asia Standard Time", "Asia/Tashkent"),
+    ("Central Asia Standard Time", "Asia/Almaty"),
+    ("India Standard Time", "Asia/Kolkata"),
+    ("Sri Lanka Standard Time", "Asia/Colombo"),
+    ("Nepal Standard Time", "Asia/Kathmandu"),
+    ("Bangladesh Standard Time", "Asia/Dhaka"),
+    ("SE Asia Standard Time", "Asia/Bangkok"),
+    ("China Standard Time", "Asia/Shanghai"),
+    ("Singapore Standard Time", "Asia/Singapore"),
+    ("Taipei Standard Time", "Asia/Taipei"),
+    ("W. Australia Standard Time", "Australia/Perth"),
+    ("Tokyo Standard Time", "Asia/Tokyo"),
+    ("Korea Standard Time", "Asia/Seoul"),
+    ("AUS Central Standard Time", "Australia/Darwin"),
+    ("Cen. Australia Standard Time", "Australia/Adelaide"),
+    ("E. Australia Standard Time", "Australia/Brisbane"),
+    ("AUS Eastern Standard Time", "Australia/Sydney"),
+    ("Tasmania Standard Time", "Australia/Hobart"),
+    ("New Zealand Standard Time", "Pacific/Auckland"),
+];
+
+/// The built-in IANA zone a Windows time zone name stands for (`Pacific Standard Time` →
+/// `America/Los_Angeles`, case-insensitive), or the canonical spelling of an IANA name given instead;
+/// `None` for UTC, fixed offsets and unknown names.
+pub fn iana_of_windows(name: &str) -> Option<&'static str> {
+    let n = name.trim().trim_matches('"');
+    match WINDOWS_ZONES.iter().find(|(w, _)| w.eq_ignore_ascii_case(n)) {
+        Some((_, iana)) => builtin_name(iana),
+        None => builtin_name(n),
+    }
+}
+
+/// The Windows time zone name of a built-in IANA zone (any alias in its table row), for services that
+/// expect one; `None` when the table has none.
+pub fn windows_of_iana(iana: &str) -> Option<&'static str> {
+    let name = iana.trim().trim_matches('"');
+    let row = BUILTIN.iter().find(|(names, _, _)| names.iter().any(|n| n.eq_ignore_ascii_case(name)))?;
+    WINDOWS_ZONES.iter().find(|(_, i)| row.0.iter().any(|n| n.eq_ignore_ascii_case(i))).map(|(w, _)| *w)
 }
 
 /// The zones a calendar defines plus the built-in fallback.

@@ -369,8 +369,11 @@ fn folder(s: &mut Session, p: &Value) -> CmdResult {
             s.notify(Notice::Info(msg));
         }
         let over_jmap = s.mailbox.account(account).is_some_and(|a| crate::sync::pim::via_jmap(a, kind));
+        let over_graph = s.mailbox.account(account).is_some_and(|a| crate::sync::pim::via_graph(a, kind));
         let server = if synced && over_jmap {
             "jmap"
+        } else if synced && over_graph {
+            "graph"
         } else if synced {
             "dav"
         } else if on_server {

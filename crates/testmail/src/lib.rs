@@ -28,7 +28,9 @@
 //!
 //! - a fake Microsoft Graph mail service (REST v1.0 shapes: mail folders, per-folder message delta queries with
 //!   paging, `$value`, sendMail, drafts, attachments with upload sessions, throttling on demand) on the web
-//!   server's ports under `/graph/v1.0` (`graph.rs`), over the same mail.
+//!   server's ports under `/graph/v1.0` (`graph.rs`), over the same mail; with contacts, calendars (series,
+//!   exceptions, calendar view deltas, other users' shared calendars, the service's own scheduling and
+//!   answers) and Microsoft To Do tasks (`graph_pim.rs`).
 //!
 //! - an OAuth 2.0 authorization server (device grant, authorization code with PKCE, refresh tokens) whose
 //!   access tokens sign in to IMAP and SMTP (XOAUTH2, OAUTHBEARER) and JMAP (Bearer), plus autoconfig
@@ -51,6 +53,7 @@ mod dav;
 mod dns;
 pub mod ews;
 mod graph;
+mod graph_pim;
 mod imap;
 mod jmap;
 mod mime;
@@ -746,6 +749,48 @@ impl TestServers {
     /// While `on`, Graph refuses to open attachment upload sessions (413, as for a file over its limit).
     pub fn graph_refuse_uploads(&self, on: bool) {
         self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).refuse_uploads = on;
+    }
+
+    /// Shares `owner`'s default calendar with `with` on the fake Graph service (`edit`: may change it), so
+    /// `/users/{owner}/calendar` answers for `with` and it is listed in their `/me/calendars`.
+    pub fn graph_share_calendar(&self, owner: &str, with: &str, edit: bool) {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).pim.share_calendar(owner, with, edit);
+    }
+
+    /// Makes the next `count` Graph event actions (`accept`, `tentativelyAccept`, `decline`, `cancel`) answer
+    /// 503 Service Unavailable (not repeated by clients: an action is a POST).
+    pub fn graph_fail_actions(&self, count: u32) {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).pim.fail_actions = count;
+    }
+
+    /// While `on`, every Graph contacts, calendar and To Do request answers 403, as for a token signed in for
+    /// mail only.
+    pub fn graph_deny_pim(&self, on: bool) {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).pim.deny = on;
+    }
+
+    /// Makes every Graph contacts, calendar and To Do delta link given out so far unknown (410), as when the
+    /// service drops its sync states.
+    pub fn graph_expire_deltas(&self) {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).pim.expire_deltas();
+    }
+
+    /// `user`'s Graph objects of `kind` (`contacts`, `events` with series masters and exceptions, `tasks`) as
+    /// the service lists them, each with `_collection` (its folder, calendar or list name) and, for a series,
+    /// `_cancelled` (original starts of cancelled occurrences).
+    pub fn graph_objects(&self, user: &str, kind: &str) -> Vec<serde_json::Value> {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).pim.objects_json(user, kind)
+    }
+
+    /// Invitations, updates and cancellations the fake Graph service sent for its users' meetings:
+    /// `{"organizer", "attendee", "subject", "kind"}`.
+    pub fn graph_invitations(&self) -> Vec<serde_json::Value> {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).pim.invitations.clone()
+    }
+
+    /// Meeting answers given through the event actions: `{"user", "uid", "action", "comment", "sendResponse"}`.
+    pub fn graph_responses(&self) -> Vec<serde_json::Value> {
+        self.inner.ctx.graph.lock().unwrap_or_else(|e| e.into_inner()).pim.responses.clone()
     }
 
     /// Graph requests received ("METHOD /path?query"), oldest first.

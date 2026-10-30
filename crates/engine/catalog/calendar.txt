@@ -38,11 +38,11 @@ Calendar|Home > New Items > More Items|Task Request|tasks.assign
 Calendar|Home > New Items > More Items|Internet Fax|-|requires a third-party internet fax service provider
 Calendar|Home > New Items > More Items|Choose Form...|mail.newItem
 Calendar|Home > New Items > More Items|Data File...|file.newDataFile
-Calendar|Home > Add Calendar|From Address Book...|-|opening other people's calendars from the address book needs Exchange delegate access, which Exchange (EWS) accounts do not use yet
-Calendar|Home > Add Calendar|From Room List...|-|room lists and room calendars are Exchange directory objects; Exchange (EWS) accounts do not read the directory yet
+Calendar|Home > Add Calendar|From Address Book...|calendar.addCalendar
+Calendar|Home > Add Calendar|From Room List...|-|room lists are directory objects MailCraft does not read (Microsoft 365 opens a room calendar by address with Open Shared Calendar)
 Calendar|Home > Add Calendar|From Internet...|calendar.addCalendar
 Calendar|Home > Add Calendar|Create New Blank Calendar...|calendar.addCalendar
-Calendar|Home > Add Calendar|Open Shared Calendar...|-|shared calendars are Exchange mailbox delegation, which Exchange (EWS) accounts do not use yet; internet calendars use From Internet
+Calendar|Home > Add Calendar|Open Shared Calendar...|calendar.addCalendar
 Calendar|Home > Share Calendar|Calendar|calendar.share
 Calendar|Send / Receive › Send & Receive|Send/Receive All Folders|sendReceive.all
 Calendar|Send / Receive › Send & Receive|Update Folder|sendReceive.folder
@@ -66,11 +66,11 @@ Calendar|Folder › Actions|Delete Calendar|folder.delete
 Calendar|Folder › Share|Add Calendar|calendar.addCalendar
 Calendar|Folder › Share|Share Calendar|calendar.share
 Calendar|Folder › Properties|Calendar Properties|folder.properties
-Calendar|Folder > Add Calendar|From Address Book...|-|opening other people's calendars from the address book needs Exchange delegate access, which Exchange (EWS) accounts do not use yet
-Calendar|Folder > Add Calendar|From Room List...|-|room lists and room calendars are Exchange directory objects; Exchange (EWS) accounts do not read the directory yet
+Calendar|Folder > Add Calendar|From Address Book...|calendar.addCalendar
+Calendar|Folder > Add Calendar|From Room List...|-|room lists are directory objects MailCraft does not read (Microsoft 365 opens a room calendar by address with Open Shared Calendar)
 Calendar|Folder > Add Calendar|From Internet...|calendar.addCalendar
 Calendar|Folder > Add Calendar|Create New Blank Calendar...|calendar.addCalendar
-Calendar|Folder > Add Calendar|Open Shared Calendar...|-|shared calendars are Exchange mailbox delegation, which Exchange (EWS) accounts do not use yet; internet calendars use From Internet
+Calendar|Folder > Add Calendar|Open Shared Calendar...|calendar.addCalendar
 Calendar|Folder > Share Calendar|Calendar|calendar.share
 Calendar|View › Current View|Change View|view.changeView
 Calendar|View › Current View|View Settings...|view.viewSettings

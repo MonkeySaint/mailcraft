@@ -8,6 +8,14 @@ What changed in each MailCraft release. Help › What's New shows the newest ent
   folder tree, mail (kept up to date with delta queries), read state, flags, categories, importance, moves,
   deletions and folder changes both ways; sending with large attachments; throttling handled. Account setup
   offers it for Microsoft 365 and Outlook.com addresses.
+- Microsoft 365 contacts, calendars and To Do tasks: contact folders, calendars (recurring series with their
+  exceptions, time zones, reminders, attendees) and task lists synchronise both ways; meetings are scheduled
+  by the service, and Accept / Tentative / Decline answer through it. Calendars other people share appear
+  under Shared Calendars, and Add Calendar › Open Shared Calendar and From Address Book open them. A meeting
+  someone else organized is never re-created on the service in your name; answers and cancellations to edit
+  first open a note before the service sends them; answers that fail for a passing reason are tried again;
+  all-day events keep their days east of UTC; fax numbers and anniversaries stay when a contact changes on
+  the service.
 
 ## 0.4.0
 
