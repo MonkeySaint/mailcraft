@@ -1487,6 +1487,27 @@ pub fn provide_image(ctx: &egui::Context, src: &str, data: &[u8]) -> bool {
     provide(ctx, src, data).0
 }
 
+/// Whether every `cid:` picture `doc` shows is still in the picture cache ([`provide_image`]): a view showing
+/// a doc another view already showed then needs no new hand-over of the message's inline pictures.
+pub fn inline_pictures_cached(ctx: &egui::Context, doc: &Doc) -> bool {
+    let mut keys = Vec::new();
+    walk_inlines(&doc.blocks, 0, &mut |i| {
+        if let Inline::Image { src, .. } = i {
+            let src = src.trim();
+            if src.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("cid:")) {
+                keys.push(fingerprint(src.as_bytes()));
+            }
+        }
+    });
+    if keys.is_empty() {
+        return true;
+    }
+    ctx.data_mut(|d| {
+        let cache = d.get_temp_mut_or_default::<ImageCache>(image_cache_id());
+        keys.iter().all(|k| cache.get(*k).is_some())
+    })
+}
+
 /// [`provide_image`] telling whether the picture was decoded just now (`false` when the cache already had
 /// these bytes for `src`, or they do not decode): what a caller needs to know to repaint once.
 pub fn provide_image_fresh(ctx: &egui::Context, src: &str, data: &[u8]) -> bool {
@@ -2001,6 +2022,22 @@ mod tests {
         );
         assert!(decode_svg(&chart).is_some());
         assert!(load_picture(&egui::Context::default(), 1, &svg("<rect width='8' height='4'/>")).is_some());
+    }
+
+    #[test]
+    fn inline_pictures_cached_tells_whether_a_doc_needs_its_pictures_again() {
+        let ctx = egui::Context::default();
+        let doc = mailcraft_html::html_to_doc(
+            "<p><img src=\"cid:a@example.org\" width=2 height=2><img src=\"https://example.org/b.png\"></p>",
+        );
+        assert!(inline_pictures_cached(&ctx, &Doc::from_plain_text("no pictures")));
+        assert!(!inline_pictures_cached(&ctx, &doc), "not handed over yet");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        assert!(provide_image(&ctx, "cid:a@example.org", &png.into_inner()));
+        assert!(inline_pictures_cached(&ctx, &doc), "remote pictures are not inline ones");
     }
 
     #[test]

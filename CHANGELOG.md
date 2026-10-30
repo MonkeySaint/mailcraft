@@ -18,6 +18,10 @@ What changed in each MailCraft release. Help › What's New shows the newest ent
 - Windows: Microsoft sign-ins are kept. Secrets longer than Windows Credential Manager allows (such as
   Microsoft access tokens) are split over several credentials and checked when read back.
 - A sign-in whose token cannot be saved now shows as failed, with the reason, instead of "Signed in".
+- Opening a message in its own window no longer shows an empty white window first: message and compose
+  windows appear once their content is drawn, and a message opened from the list reuses the body the
+  reading pane already prepared instead of reading and parsing the whole message again, so the main window
+  waits much less.
 
 ## 0.5.0
 

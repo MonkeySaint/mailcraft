@@ -294,7 +294,17 @@ pub fn item_window<T: Default>(
 ) -> T {
     let screen = ctx.content_rect();
     if !ctx.embed_viewports() {
-        return ctx.show_viewport_immediate(id, builder, ui_cb);
+        // A new OS window stays hidden until it has painted its first frame, then shows: shown as it was
+        // created, it stood blank (white on Windows) until then. eframe does the same for the main window.
+        let created = ctx.input(|i| i.raw.viewports.contains_key(&id));
+        return ctx.show_viewport_immediate(id, builder.with_visible(created), |ui, class| {
+            let out = ui_cb(ui, class);
+            if !created {
+                // Applied right after this frame is on the window.
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+            out
+        });
     }
     let fills = embedded_fills(default, screen.size());
     let float = item_float_layer(id);

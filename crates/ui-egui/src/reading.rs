@@ -458,6 +458,24 @@ fn cache_id(ctx: &egui::Context, surface: Surface) -> Id {
     surface_id(ctx, Id::new(("mailcraft.reading.cache", surface)), surface)
 }
 
+/// Layout key of the doc built for source key `sk`.
+fn doc_key(sk: u64) -> u64 {
+    sk ^ 0x9e37_79b9_7f4a_7c15
+}
+
+/// The doc the main window's reading pane built for message `item` (source key `sk`) and whether it has
+/// remote pictures, when the pane has one for that same content.
+fn shared_pane_doc(ctx: &egui::Context, item: u64, sk: u64) -> Option<(Arc<Doc>, bool)> {
+    // The main window's cache, whichever window is being drawn (`cache_id` salts it for other viewports).
+    let key = Id::new(("mailcraft.reading.cache", Surface::Main));
+    // Taken out and put back: a copy would clone the pane's whole layout.
+    let pane = ctx.data_mut(|d| d.remove_temp::<MsgCache>(key))?;
+    let shared =
+        (pane.item == item && pane.source_key == sk).then(|| (Arc::clone(&pane.doc), pane.remote_images));
+    ctx.data_mut(|d| d.insert_temp(key, pane));
+    shared
+}
+
 /// Cheap identity of a stored body (no full-content hash per frame).
 fn source_key(id: u64, b: &mailcraft_model::Body) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -812,6 +830,25 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
             ^ u64::from(plain)
             ^ (u64::from(unwrap) << 1)
             ^ translated_key.rotate_left(3);
+        // A read window opened on the message the reading pane shows (a double-click in the list) takes the
+        // pane's parsed body and the pictures it handed over, instead of reading and parsing the whole
+        // message again in the frame the window opens (that frame blocks the main window too).
+        let shared = match surface {
+            Surface::Read(_) if cache.item != id || cache.source_key != sk => {
+                shared_pane_doc(&ctx, id, sk).filter(|(doc, _)| body::inline_pictures_cached(&ctx, doc))
+            }
+            _ => None,
+        };
+        if let Some((doc, remote_images)) = shared {
+            cache = MsgCache {
+                item: id,
+                source_key: sk,
+                doc_key: doc_key(sk),
+                remote_images,
+                doc,
+                view: BodyView::default(),
+            };
+        }
         if cache.item != id || cache.source_key != sk {
             // Inline attachments, so `cid:` pictures draw instead of the placeholder.
             for (src, data) in queries::inline_pictures(&app.s, ItemId(id)) {
@@ -824,7 +861,7 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
             cache = MsgCache {
                 item: id,
                 source_key: sk,
-                doc_key: sk ^ 0x9e37_79b9_7f4a_7c15,
+                doc_key: doc_key(sk),
                 remote_images: body::has_remote_images(&doc),
                 doc: Arc::new(doc),
                 view: BodyView::default(),
@@ -2151,6 +2188,89 @@ mod tests {
         assert!(!ribbon_shown(340.0, 700.0));
         assert!(!ribbon_shown(900.0, 240.0));
         assert!(!ribbon_shown(300.0, 200.0));
+    }
+
+    /// Issue #33: a double-click opened the message's window, and the window read and parsed the whole message
+    /// again (inline pictures included) in the frame it opened, the main window waiting on it. It now takes
+    /// the body the reading pane already built.
+    #[test]
+    fn read_window_takes_the_body_the_reading_pane_built() {
+        let s = sample_session();
+        let subject =
+            s.mailbox.mail.items().find(|m| s.body_or_empty(m).html.is_some()).unwrap().subject.clone();
+        let app = app_with(&subject);
+        let id = app.s.selection.focus.unwrap().0;
+        let mut h = Harness::builder().with_size(Vec2::new(1200.0, 800.0)).build_ui_state(
+            |ui, app: &mut App| {
+                ui.ctx().set_embed_viewports(true);
+                let frame = Frame { width: 1400.0, height: 900.0, ..Frame::default() };
+                reading_pane(ui, app, &frame);
+                let ctx = ui.ctx().clone();
+                read_windows(&ctx, app);
+            },
+            app,
+        );
+        h.run();
+        let cached = |h: &Harness<'_, App>, surface: Surface| {
+            h.ctx.data(|d| d.get_temp::<MsgCache>(Id::new(("mailcraft.reading.cache", surface)))).unwrap()
+        };
+        let pane = cached(&h, Surface::Main);
+        assert_eq!(pane.item, id);
+        h.state_mut().ui.read_windows.push(id);
+        h.run();
+        let window = cached(&h, Surface::Read(id));
+        assert_eq!(window.item, id);
+        assert!(Arc::ptr_eq(&window.doc, &pane.doc), "the window shows the pane's doc, not a new parse");
+        assert_eq!(window.doc_key, pane.doc_key);
+        assert!(window.view.layout.is_some(), "laid out at the window's own width");
+        // Another message, not in the pane: the window builds its own.
+        let other = h.state().s.mailbox.mail.ids().map(|i| i.0).find(|i| *i != id).unwrap();
+        h.state_mut().ui.read_windows.push(other);
+        h.run();
+        let own = cached(&h, Surface::Read(other));
+        assert_eq!(own.item, other);
+        assert!(!Arc::ptr_eq(&own.doc, &pane.doc));
+    }
+
+    /// Issue #33: a read window was shown the moment it was created and stood empty (white on Windows) until
+    /// its first frame was drawn. It is created hidden and shows once that frame is on it.
+    #[test]
+    fn a_new_read_window_shows_once_its_first_frame_is_drawn() {
+        let built: Arc<std::sync::Mutex<Vec<(egui::ViewportId, Option<bool>)>>> = Arc::default();
+        let log = Arc::clone(&built);
+        // Stands in for eframe: draws the window's frame and notes how the window was asked to be built.
+        egui::Context::set_immediate_viewport_renderer(move |ctx, vp| {
+            log.lock().unwrap().push((vp.ids.this, vp.builder.visible));
+            let mut ui_cb = vp.viewport_ui_cb;
+            let mut input = egui::RawInput { viewport_id: vp.ids.this, ..Default::default() };
+            input.viewports.insert(vp.ids.this, egui::ViewportInfo::default());
+            ctx.run_ui(input, |ui| ui_cb(ui)).textures_delta.clear();
+        });
+        let s = sample_session();
+        let id = s.mailbox.mail.ids().next().unwrap().0;
+        let mut app = App::new(s);
+        app.ui.read_windows.push(id);
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let vid = read_viewport_id(id);
+        // One main-window frame; `created`: the platform has the window (the main window's input lists it).
+        // Returns what the window was told to do at the end of the frame (after both windows were drawn).
+        let frame = |app: &mut App, created: bool| {
+            let mut input = egui::RawInput::default();
+            if created {
+                input.viewports.insert(vid, egui::ViewportInfo::default());
+            }
+            let mut out = ctx.run_ui(input, |ui| read_windows(ui.ctx(), app));
+            out.textures_delta.clear();
+            out.viewport_output.get(&vid).map(|o| o.commands.clone()).unwrap_or_default()
+        };
+        let shows = |c: &[egui::ViewportCommand]| c.contains(&egui::ViewportCommand::Visible(true));
+        let first = frame(&mut app, false);
+        let second = frame(&mut app, true);
+        let built = built.lock().unwrap().clone();
+        assert_eq!(built, vec![(vid, Some(false)), (vid, Some(true))], "created hidden, then kept shown");
+        assert!(shows(&first), "shown once its first frame is drawn");
+        assert!(!shows(&second));
     }
 
     #[test]
