@@ -2,6 +2,15 @@
 
 What changed in each MailCraft release. Help › What's New shows the newest entries from this file.
 
+## Unreleased
+
+- A message window no longer slows the main window down while it is open: the list order its Previous /
+  Next Item use is built once per change of the list instead of several times per frame (a folder with
+  thousands of messages made every frame wait).
+- Troubleshooting logging records how long a new message or compose window takes to open (its content, and
+  creating and showing the window), how long a message body takes to read, and any frame that held up the
+  main window for 100 ms or more, part by part.
+
 ## 0.5.1
 
 - Add Account: "(Not you?)", or another address after an account was added, now sets up a new account and

@@ -19,6 +19,7 @@ pub mod dialogs;
 pub mod edit_message;
 pub mod explorer;
 pub mod folders;
+pub mod frame_timing;
 pub mod icons;
 pub mod keys;
 pub mod list;
@@ -515,6 +516,7 @@ impl App {
     /// builds it from the context). The main window always covers the whole viewport.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let mut timer = frame_timing::FrameTimer::start();
         self.ui.egui_ctx = Some(ctx.clone());
         self.ui.embedded_viewports = ctx.embed_viewports();
         // The main window was asked to close (its close button, or File › Exit): a message with unsaved
@@ -527,7 +529,9 @@ impl App {
         // Control-channel requests (when `--control-port` asked for one) apply before drawing.
         #[cfg(not(target_arch = "wasm32"))]
         control::frame(&ctx, self);
+        timer.lap("control");
         self.poll_sync(&ctx);
+        timer.lap("sync results");
         modules::calendar_background(&ctx, self);
         dialogs::auto_archive_tick(&ctx, self);
         compose::clipboard_watch(&ctx, self);
@@ -536,6 +540,7 @@ impl App {
         self.sync_window(&ctx);
         self.sync_envelope(&ctx);
         self.apply_todo_bar(&ctx);
+        timer.lap("background work");
 
         // The whole viewport, whatever margins the host ui carries (test harnesses wrap it in a panel frame).
         let rect = ctx.content_rect();
@@ -544,10 +549,13 @@ impl App {
         let mut window = ui.new_child(egui::UiBuilder::new().id_salt("mailcraft_main_window").max_rect(rect));
         window.set_clip_rect(rect);
         chrome::main_window(&mut window, self, &frame);
+        timer.lap("main window");
 
         reading::read_windows(&ctx, self);
+        timer.lap("message windows");
         explorer::explorer_windows(&ctx, self);
         compose::compose_windows(&ctx, self);
+        timer.lap("other windows");
         backstage::backstage(&ctx, self);
         // Item windows (appointment, contact, task, Go to Date) take their requests out of `ui.dialogs`
         // before the dialogs area draws the rest; a no-op when a module view already drew them this pass.
@@ -560,6 +568,8 @@ impl App {
             ctx.copy_text(text);
         }
         self.draw_toasts(&ctx);
+        timer.lap("dialogs");
+        timer.finish();
     }
 
     /// A folder renamed in place whose row did not show (collapsed parent, pane hidden) gets the Rename

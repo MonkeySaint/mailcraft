@@ -332,6 +332,24 @@ fn state_id() -> Id {
     Id::new("mailcraft.list.state")
 }
 
+/// The messages in the main window's list order, the order Previous / Next Item walk
+/// ([`queries::visible_item_ids`]). Read windows ask for it every frame; it is built again only when the
+/// list changes ([`fingerprint`], as the list's own rows), not once per window per frame: with thousands of
+/// messages in the folder that rebuild held up every frame of the main window while a message window was
+/// open.
+pub fn visible_ids(ctx: &egui::Context, s: &Session) -> Arc<Vec<mailcraft_model::ItemId>> {
+    let key = fingerprint(s);
+    let id = Id::new("mailcraft.list.visible-ids");
+    if let Some((k, ids)) = ctx.data(|d| d.get_temp::<(u64, Arc<Vec<mailcraft_model::ItemId>>)>(id))
+        && k == key
+    {
+        return ids;
+    }
+    let ids = Arc::new(queries::visible_item_ids(s));
+    ctx.data_mut(|d| d.insert_temp(id, (key, ids.clone())));
+    ids
+}
+
 /// Cheap fingerprint of everything `list_rows` depends on. A mutating command that changes the mailbox
 /// always pushes a new undo entry (each holds a freshly boxed small-state snapshot), so the top entry's
 /// address changes with it.
@@ -2166,6 +2184,21 @@ mod tests {
         assert!(!collapsed(&h.state().s, "Red category"));
         // The engine checks a named group exists.
         assert!(h.state_mut().s.run("view.collapseGroup", &json!({"label": "No such group"})).is_err());
+    }
+
+    #[test]
+    fn visible_ids_are_built_once_per_list_change() {
+        // Read windows ask for the list order every frame; it is only built again when the list changes.
+        let mut s = sample_session();
+        s.fixed_now = Some(s.now());
+        let ctx = egui::Context::default();
+        let first = visible_ids(&ctx, &s);
+        assert_eq!(*first, queries::visible_item_ids(&s));
+        assert!(Arc::ptr_eq(&first, &visible_ids(&ctx, &s)), "the same list is not built again");
+        s.run("search.query", &json!({"text": "zzz-no-such-word"})).unwrap();
+        let searched = visible_ids(&ctx, &s);
+        assert!(!Arc::ptr_eq(&first, &searched));
+        assert_eq!(*searched, queries::visible_item_ids(&s));
     }
 
     #[test]

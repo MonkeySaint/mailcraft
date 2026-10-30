@@ -297,14 +297,21 @@ pub fn item_window<T: Default>(
         // A new OS window stays hidden until it has painted its first frame, then shows: shown as it was
         // created, it stood blank (white on Windows) until then. eframe does the same for the main window.
         let created = ctx.input(|i| i.raw.viewports.contains_key(&id));
-        return ctx.show_viewport_immediate(id, builder.with_visible(created), |ui, class| {
+        let title = builder.title.clone().unwrap_or_default();
+        let start = crate::frame_timing::Stamp::now();
+        let mut content = 0.0;
+        let out = ctx.show_viewport_immediate(id, builder.with_visible(created), |ui, class| {
+            let drawn = crate::frame_timing::Stamp::now();
             let out = ui_cb(ui, class);
+            content = drawn.ms();
             if !created {
                 // Applied right after this frame is on the window.
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
             }
             out
         });
+        crate::frame_timing::item_window_frame(&title, !created, start.ms(), content);
+        return out;
     }
     let fills = embedded_fills(default, screen.size());
     let float = item_float_layer(id);

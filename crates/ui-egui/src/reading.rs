@@ -312,7 +312,7 @@ pub fn read_windows(ctx: &egui::Context, app: &mut App) {
             continue;
         };
         if after != "returnToFolder" {
-            let order = queries::visible_item_ids(&app.s);
+            let order = crate::list::visible_ids(ctx, &app.s);
             if let Some(p) = order.iter().position(|i| i.0 == id) {
                 let prev = p.checked_sub(1).and_then(|q| order.get(q)).map(|i| i.0);
                 let next = order.get(p.saturating_add(1)).map(|i| i.0);
@@ -850,14 +850,24 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
             };
         }
         if cache.item != id || cache.source_key != sk {
+            let start = crate::frame_timing::Stamp::now();
             // Inline attachments, so `cid:` pictures draw instead of the placeholder.
             for (src, data) in queries::inline_pictures(&app.s, ItemId(id)) {
                 body::provide_image(&ctx, &src, &data);
             }
+            let pictures = start.ms();
             let doc = match &translated {
                 Some(t) => Doc::from_plain_text(t),
                 None => body_doc(&shown_body, plain, unwrap),
             };
+            let total = start.ms();
+            if total >= 20.0 {
+                log::debug!(
+                    "message {id} ({surface:?}): body read in {total:.0} ms ({pictures:.0} ms inline pictures, {:.0} ms \
+                     HTML to text)",
+                    total - pictures
+                );
+            }
             cache = MsgCache {
                 item: id,
                 source_key: sk,
@@ -1045,7 +1055,7 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
         let mut step = None;
         right.allocate_ui_with_layout(Vec2::new(right_w, 20.0), Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            let order = queries::visible_item_ids(&app.s);
+            let order = crate::list::visible_ids(ui.ctx(), &app.s);
             let pos = order.iter().position(|i| i.0 == id);
             let has_next = pos.is_some_and(|p| p.saturating_add(1) < order.len());
             let has_prev = pos.is_some_and(|p| p > 0);
@@ -1556,7 +1566,7 @@ fn read_quick_access(ui: &mut Ui, app: &mut App, id: u64, embedded: bool, tiny: 
     let mut close = false;
     let can_undo = crate::keys::enabled(&app.s, "app.undo");
     let can_redo = crate::keys::enabled(&app.s, "app.redo");
-    let order = queries::visible_item_ids(&app.s);
+    let order = crate::list::visible_ids(ui.ctx(), &app.s);
     let pos = order.iter().position(|i| i.0 == id);
     let neighbour = |step: Option<usize>| {
         step.and_then(|p| order.get(p)).is_some_and(|n| !app.ui.read_windows.contains(&n.0))
