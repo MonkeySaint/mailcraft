@@ -10,6 +10,9 @@ What changed in each MailCraft release. Help › What's New shows the newest ent
 - Troubleshooting logging records how long a new message or compose window takes to open (its content, and
   creating and showing the window), how long a message body takes to read, and any frame that held up the
   main window for 100 ms or more, part by part.
+- Troubleshooting logging also records start-up times (profile opened, window and renderer ready, first
+  frame). `MAILCRAFT_RENDERER=wgpu` draws with wgpu (Direct3D 12 on Windows, Vulkan or Metal elsewhere)
+  instead of OpenGL, to compare on machines where windows open slowly.
 
 ## 0.5.1
 

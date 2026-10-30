@@ -12,6 +12,9 @@
 //! The profile (mail store) defaults to the platform data folder: `$XDG_DATA_HOME/MailCraft` or
 //! `~/.local/share/MailCraft` on Linux and other Unix systems, `~/Library/Application Support/MailCraft` on
 //! macOS, `%APPDATA%\MailCraft` on Windows.
+//!
+//! `MAILCRAFT_RENDERER=wgpu` draws with wgpu (Direct3D 12 on Windows, Vulkan or Metal elsewhere) instead of
+//! OpenGL, the default.
 
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
@@ -41,6 +44,9 @@ Options:
 
 Arguments:
   mailto:<address>      Open a new message (RFC 6068 mailto: link)
+
+Environment:
+  MAILCRAFT_RENDERER    opengl (default) or wgpu (Direct3D 12 on Windows, Vulkan or Metal elsewhere)
 ";
 
 /// `git <hash>, <date>` from `build.rs` (`unknown` when the build had neither git nor the variables).
@@ -179,14 +185,40 @@ fn save_on_exit(s: &mut Session) {
     }
 }
 
+/// When `main` started (start-up times in the troubleshooting log).
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Milliseconds since `main` started.
+fn since_start() -> u128 {
+    STARTED.get().map_or(0, |t| t.elapsed().as_millis())
+}
+
+/// The renderer `MAILCRAFT_RENDERER` asks for: wgpu, else OpenGL.
+fn renderer(var: Option<&str>) -> eframe::Renderer {
+    match var.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("wgpu" | "d3d12" | "dx12" | "vulkan" | "metal") => eframe::Renderer::Wgpu,
+        _ => eframe::Renderer::Glow,
+    }
+}
+
 /// eframe adapter.
 struct MailCraft {
     app: App,
+    /// The first frame is still to come (its time goes to the troubleshooting log).
+    first_frame: bool,
 }
 
 impl eframe::App for MailCraft {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        let first = std::mem::take(&mut self.first_frame);
+        let start = since_start();
         self.app.ui_root(ui);
+        if first {
+            log::debug!(
+                "start-up: first frame at {start} ms, drawn in {} ms",
+                since_start().saturating_sub(start)
+            );
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -199,6 +231,7 @@ impl eframe::App for MailCraft {
 }
 
 fn main() -> ExitCode {
+    STARTED.get_or_init(std::time::Instant::now);
     // PST files are read in a process of their own (see `mailcraft_engine::pst`): this program, started
     // with `--pst-worker FILE`, is that reader.
     let argv: Vec<String> = std::env::args().collect();
@@ -227,6 +260,7 @@ fn main() -> ExitCode {
     mailcraft_ui_egui::backstage::set_build_info(BUILD_INFO);
 
     let mut session = open_session(&args);
+    log::debug!("start-up: profile opened at {} ms", since_start());
     // Quick Print goes straight to the default printer in the desktop app.
     session.direct_print = true;
     let mut app = App::new(session);
@@ -254,13 +288,17 @@ fn main() -> ExitCode {
     if let Some((rgba, width, height)) = mailcraft_ui_egui::app_icon_rgba(256) {
         viewport = viewport.with_icon(eframe::egui::IconData { rgba, width, height });
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let renderer = renderer(std::env::var("MAILCRAFT_RENDERER").ok().as_deref());
+    let options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
+    log::debug!("start-up: opening the window at {} ms ({renderer:?} renderer)", since_start());
     let result = eframe::run_native(
         "MailCraft",
         options,
         Box::new(move |cc| {
+            log::debug!("start-up: window and renderer ready at {} ms", since_start());
             App::install_fonts(&cc.egui_ctx);
-            Ok(Box::new(MailCraft { app }))
+            log::debug!("start-up: fonts installed at {} ms", since_start());
+            Ok(Box::new(MailCraft { app, first_frame: true }))
         }),
     );
     match result {
@@ -274,6 +312,16 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_renderer_is_opengl_unless_wgpu_is_asked_for() {
+        use eframe::Renderer;
+        assert_eq!(super::renderer(None), Renderer::Glow);
+        assert_eq!(super::renderer(Some("opengl")), Renderer::Glow);
+        assert_eq!(super::renderer(Some("nonsense")), Renderer::Glow);
+        assert_eq!(super::renderer(Some(" WGPU ")), Renderer::Wgpu);
+        assert_eq!(super::renderer(Some("dx12")), Renderer::Wgpu);
+    }
+
     use super::*;
 
     fn parse(v: &[&str]) -> Result<Args, String> {
