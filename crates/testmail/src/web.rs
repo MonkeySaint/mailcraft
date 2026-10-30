@@ -13,8 +13,10 @@
 //!
 //! - the fake Microsoft Graph mail service of [`crate::graph`] under `/graph/v1.0/` (and its upload sessions
 //!   under `/graph-upload/`).
+//! - Exchange Web Services and Autodiscover ([`crate::ews`]) at `/EWS/Exchange.asmx` and
+//!   `…/autodiscover/autodiscover.xml`, on kept-alive connections.
 //!
-//! Every request path is logged ([`crate::TestServers::web_requests`]). One request per connection.
+//! Every other request path is logged ([`crate::TestServers::web_requests`]), one request per connection.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -42,10 +44,15 @@ pub type SharedWeb = Arc<Mutex<WebState>>;
 const MAX_LOG: usize = 1000;
 
 pub fn serve(mut conn: Conn, ctx: &Ctx) {
-    // Graph takes whole messages (base64) in one request.
+    // Graph and Exchange Web Services take whole messages (base64) in one request.
     let max = crate::dav::MAX_RESOURCE.max(ctx.config.max_message_size.saturating_mul(2)) + 64 * 1024;
     if let Ok(Some(req)) = read_request(&mut conn, max) {
         let path = req.path.split('?').next().unwrap_or_default();
+        if crate::ews::handles(path) {
+            // Exchange Web Services and Autodiscover keep the connection (NTLM signs in a connection).
+            crate::ews::serve(conn, ctx, req);
+            return;
+        }
         let _ = if crate::graph::handles(path) {
             crate::graph::handle(&mut conn, ctx, &req)
         } else if crate::dav::handles(path) {

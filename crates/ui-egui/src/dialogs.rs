@@ -15,6 +15,7 @@ mod account_tests;
 mod accounts;
 mod alerts;
 mod archive;
+mod auto_replies;
 mod bookmark_dlg;
 mod borders_dlg;
 mod categories;
@@ -436,6 +437,9 @@ fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         return out;
     }
     if let Some(out) = holidays::show(ctx, app, d) {
+        return out;
+    }
+    if let Some(out) = auto_replies::show(ctx, app, d) {
         return out;
     }
     if let Some(out) = print::show(ctx, app, d) {

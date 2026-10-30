@@ -90,6 +90,7 @@ pub(super) enum Incoming {
     Pop3(Pop3Settings),
     Jmap(super::jmap::JmapConn),
     Graph(super::graph::GraphConn),
+    Ews(super::ews::EwsConn),
 }
 
 /// What a worker needs to refresh an OAuth access token.
@@ -124,6 +125,7 @@ impl Conn {
             Incoming::Pop3(p) => swap(&mut p.credentials),
             Incoming::Jmap(j) => j.set_bearer(token),
             Incoming::Graph(g) => g.set_token(token),
+            Incoming::Ews(e) => e.set_bearer(token),
         }
         if let Some(c) = self.smtp.as_mut().and_then(|s| s.credentials.as_mut()) {
             swap(c);
@@ -173,6 +175,8 @@ struct Job {
     jmap: Option<super::jmap::JmapJob>,
     /// Microsoft Graph: local changes, receive and downloads.
     graph: Option<super::graph::GraphJob>,
+    /// Exchange (EWS): local changes, the Outbox and receiving.
+    ews: Option<super::ews::EwsJob>,
     /// Contacts and tasks (CardDAV / CalDAV) and calendar publishing.
     dav: Option<super::dav::DavJob>,
     /// IMAP: a server search (Search › Include Older Results).
@@ -326,6 +330,10 @@ pub(super) enum Event {
         account: AccountId,
         ev: Box<super::graph::GraphEvent>,
     },
+    Ews {
+        account: AccountId,
+        ev: super::ews::EwsEvent,
+    },
     /// Contacts, tasks and published calendars (see `pim.rs`).
     Dav {
         account: AccountId,
@@ -382,6 +390,7 @@ impl Event {
             | Event::Pop3Server { account, .. }
             | Event::Jmap { account, .. }
             | Event::Graph { account, .. }
+            | Event::Ews { account, .. }
             | Event::Dav { account, .. }
             | Event::SharedRoots { account, .. }
             | Event::Tokens { account, .. }
@@ -615,6 +624,9 @@ pub(super) fn conn_settings(s: &Session, a: &Account) -> Result<Conn, String> {
         Incoming::Jmap(super::jmap::JmapConn::new(&inc.host, &creds, connect_options(inc)?))
     } else if a.kind == AccountKind::Graph {
         Incoming::Graph(super::graph::GraphConn::new(&inc.host, &creds, connect_options(inc)?))
+    } else if a.kind == AccountKind::Exchange {
+        let url = super::ews::ews_url(&inc.host);
+        Incoming::Ews(super::ews::EwsConn::new(&url, &inc.auth, &creds, connect_options(inc)?, &a.address))
     } else if crate::accounts::is_pop3(s, a.id) {
         let mut p = Pop3Settings::from_server(inc, creds);
         p.options = connect_options(inc)?;
@@ -625,7 +637,10 @@ pub(super) fn conn_settings(s: &Session, a: &Account) -> Result<Conn, String> {
         Incoming::Imap(imap)
     };
     let smtp = match &a.outgoing {
-        Some(o) if !o.host.trim().is_empty() && !matches!(a.kind, AccountKind::Jmap | AccountKind::Graph) => {
+        Some(o)
+            if !o.host.trim().is_empty()
+                && !matches!(a.kind, AccountKind::Jmap | AccountKind::Graph | AccountKind::Exchange) =>
+        {
             let mut st = SmtpSettings::new(o.host.clone(), o.port, o.security);
             st.auth_mechanism = o.auth.clone();
             st.options = connect_options(o)?;
@@ -667,7 +682,8 @@ pub(super) fn jmap_push_target(s: &Session, id: AccountId) -> Option<PushTarget>
 /// Outbox messages due for sending, oldest first.
 fn outgoing_items(s: &Session, a: &Account, plan: &Plan, now: i64) -> Vec<Outgoing> {
     let mut outgoing = Vec::new();
-    let can = a.outgoing.is_some() || matches!(a.kind, AccountKind::Jmap | AccountKind::Graph);
+    let can = a.outgoing.is_some()
+        || matches!(a.kind, AccountKind::Jmap | AccountKind::Graph | AccountKind::Exchange);
     if !plan.send || !can {
         return outgoing;
     }
@@ -859,8 +875,8 @@ fn pop3_job(
 pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<bool, String> {
     let Some(a) = s.mailbox.account(id).cloned() else { return Ok(false) };
     match a.kind {
-        AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph => {}
-        AccountKind::Local | AccountKind::Exchange => return Ok(false),
+        AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph | AccountKind::Exchange => {}
+        AccountKind::Local => return Ok(false),
     }
     if let Some(run) = s.sync.runs.get_mut(&id)
         && run.busy.is_some()
@@ -885,7 +901,11 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         Incoming::Jmap(c) => Some(c),
         _ => None,
     };
-    let dav = super::dav::build_job(s, &a, &plan, jmap_conn).filter(|j| !j.is_empty());
+    let ews_conn = match &conn.incoming {
+        Incoming::Ews(c) => Some(c),
+        _ => None,
+    };
+    let dav = super::dav::build_job(s, &a, &plan, jmap_conn, ews_conn).filter(|j| !j.is_empty());
     let full_plan = plan;
     let plan = super::dav::mail_only(s, id, &full_plan);
     let outgoing = outgoing_items(s, &a, &plan, now);
@@ -900,6 +920,7 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         pop3: None,
         jmap: None,
         graph: None,
+        ews: None,
         dav,
         search: None,
         jmap_search: None,
@@ -931,6 +952,9 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
                 headers && !force_headers && !slow && opts.download == DownloadMode::HeadersThenFull;
             job.graph = super::graph::build_job(s, &a, &plan, window, headers, then_full, &fetch_items);
         }
+        Incoming::Ews(_) => {
+            job.ews = super::ews::build_job(s, &a, &plan, window, &job.outgoing);
+        }
     }
     if older.is_some() && job.search.is_none() && job.jmap_search.is_none() {
         // Nothing of this account to search after all (no folder of it in the scope).
@@ -944,6 +968,7 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         && job.pop3.is_none()
         && job.jmap.is_none()
         && job.graph.is_none()
+        && job.ews.is_none()
         && job.dav.is_none()
         && job.search.is_none()
         && job.jmap_search.is_none()
@@ -961,6 +986,7 @@ pub(super) fn dispatch(s: &mut Session, id: AccountId, plan: Plan) -> Result<boo
         || job.pop3.is_some()
         || job.jmap.is_some()
         || job.graph.is_some()
+        || job.ews.is_some()
         || job.dav.is_some();
     let progress = if receiving || !job.fetch.is_empty() { "Connecting…" } else { "Sending…" };
     s.sync.rt.submit(id, job)?;
@@ -1362,6 +1388,7 @@ fn run_job(
         || job.pop3.is_some()
         || job.jmap.is_some()
         || job.graph.is_some()
+        || job.ews.is_some()
         || job.search.is_some()
         || job.jmap_search.is_some();
     let res = if !mail_part {
@@ -1417,6 +1444,12 @@ fn run_job(
                 } else {
                     end.error
                 }
+            }
+            Incoming::Ews(conn) => {
+                if let Some(mut old) = slot.take() {
+                    old.disconnect();
+                }
+                super::ews::run(account, &conn, job.ews.as_ref(), events, cancel)
             }
         }
     };
@@ -1900,6 +1933,18 @@ fn run_test(account: AccountId, conn: Result<Conn, String>) -> TestReport {
             }
             return r;
         }
+        Incoming::Ews(e) => {
+            match e.connect() {
+                Ok(_) => {
+                    r.incoming_ok = true;
+                    r.incoming = format!("Signed in to {} (Exchange Web Services).", e.url());
+                    r.outgoing_ok = Some(true);
+                    r.outgoing = "Sending uses the same Exchange server.".into();
+                }
+                Err(e) => r.incoming = e.to_string(),
+            }
+            return r;
+        }
         Incoming::Jmap(j) => {
             match j.connect() {
                 Ok(_) => {
@@ -2164,6 +2209,7 @@ pub(super) fn poll_events(s: &mut Session) -> bool {
                 | Event::Pop3Full { .. }
                 | Event::Jmap { .. }
                 | Event::Graph { .. }
+                | Event::Ews { .. }
                 | Event::Dav { .. }
                 | Event::SharedRoots { .. }
                 | Event::OAuthDone { .. }
@@ -2275,6 +2321,7 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
             }
             Event::Jmap { account, ev } => super::jmap::apply(s, account, ev, &mut new_inbox),
             Event::Graph { account, ev } => super::graph::apply(s, account, *ev, &mut new_inbox),
+            Event::Ews { account, ev } => super::ews::apply(s, account, ev, &mut new_inbox),
             Event::Dav { account, ev } => super::pim::apply(s, account, *ev),
             Event::SharedRoots { account, roots } => super::shared::apply_roots(s, account, roots),
             Event::Tokens { account, tokens } => store_tokens(s, account, &tokens),
@@ -2682,7 +2729,8 @@ fn message_sent(s: &mut Session, account: AccountId, item: ItemId, result: Resul
             }
             // JMAP servers file the sent copy themselves (EmailSubmission onSuccessUpdateEmail).
             let saves = s.mailbox.account(account).is_some_and(|a| {
-                a.server_saves_sent || matches!(a.kind, AccountKind::Jmap | AccountKind::Graph)
+                a.server_saves_sent
+                    || matches!(a.kind, AccountKind::Jmap | AccountKind::Graph | AccountKind::Exchange)
             });
             let sent = s.mailbox.role_folder(account, FolderRole::SentItems);
             match sent {

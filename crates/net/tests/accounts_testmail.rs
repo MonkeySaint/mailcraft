@@ -39,6 +39,8 @@ fn discover_opts(s: &TestServers) -> DiscoverOptions {
         http: opts(s),
         tenant_url: Some(s.tenant_url_template()),
         allow_reserved: true,
+        autodiscover_urls: Vec::new(),
+        autodiscover_probe: None,
     }
 }
 

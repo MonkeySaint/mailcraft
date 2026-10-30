@@ -467,15 +467,28 @@ fn info(ui: &mut Ui, app: &mut App, st: &mut PageState) {
     }
     rule(ui, app);
     account_settings_menu(ui, app, acct.as_ref());
-    tile_with(
+    // Replies the server sends while you are away: for the Exchange account chosen above.
+    let exchange = acct
+        .as_ref()
+        .filter(|a| a.kind == mailcraft_model::AccountKind::Exchange && a.incoming.is_some())
+        .map(|a| a.id.0);
+    let replies_desc = if exchange.is_some() {
+        "Let people know you're away: the Exchange server answers mail for you."
+    } else {
+        "Let people know you're away. Needs a mail server that sends replies for you (an Exchange account)."
+    };
+    if tile_with(
         ui,
         app,
         "calendar-reminder",
         "Automatic Replies...",
-        "Let people know you're away. Needs a mail server that sends replies for you.",
-        false,
+        replies_desc,
+        exchange.is_some(),
         |_, _| {},
-    );
+    ) && let Some(id) = exchange
+    {
+        app.run("file.automaticReplies", json!({"account": id}));
+    }
     let (used, items, deleted) = mailbox_size(app, current);
     let quota = acct.as_ref().and_then(|a| mailcraft_engine::sync::account_quota(&app.s, a.id));
     let mut tools: Option<&str> = None;
@@ -1646,5 +1659,49 @@ mod tests {
         let local =
             s.mailbox.accounts.iter().find(|a| a.kind == mailcraft_model::AccountKind::Local).unwrap();
         assert_eq!(super::kind_label(&s, local), "Local data file");
+    }
+
+    /// File › Info has one Automatic Replies tile, in its place before Tools, working for the Exchange
+    /// account chosen on the page and disabled for others.
+    #[test]
+    fn one_automatic_replies_tile_follows_the_chosen_account() {
+        use egui_kittest::kittest::Queryable;
+        let session = || {
+            let mut s = mailcraft_engine::sample::sample_session();
+            let r = s
+                .run(
+                    "accounts.add",
+                    &json!({"kind": "exchange", "address": "kim@example.com", "password": "x",
+                            "incoming": {"host": "https://ews.example.com/EWS/Exchange.asmx"}}),
+                )
+                .unwrap();
+            let ex = u32::try_from(r["account"].as_u64().unwrap()).unwrap();
+            let local = s
+                .mailbox
+                .accounts
+                .iter()
+                .find(|a| a.kind == mailcraft_model::AccountKind::Local)
+                .unwrap()
+                .id
+                .0;
+            (s, ex, local)
+        };
+        let (_, ex, local) = session();
+        let page = |account: u32| {
+            let app = crate::App::new(session().0);
+            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(900.0, 1400.0)).build_ui_state(
+                move |ui, app: &mut crate::App| {
+                    let mut st = super::PageState { account: Some(account), ..Default::default() };
+                    super::info(ui, app, &mut st);
+                },
+                app,
+            );
+            h.run();
+            let tiles = h.query_all_by_label("Automatic Replies...").count();
+            let working = h.query_all_by_label_contains("the Exchange server answers mail for you").count();
+            (tiles, working)
+        };
+        assert_eq!(page(ex), (1, 1), "one working tile for the Exchange account");
+        assert_eq!(page(local), (1, 0), "one disabled tile otherwise");
     }
 }

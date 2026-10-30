@@ -83,6 +83,15 @@ pub fn specs() -> Vec<CommandSpec> {
             account_settings,
         ),
         spec("file.manageRules", "Manage Rules & Alerts", "File › Info", "", false, always, manage_rules),
+        spec(
+            "file.automaticReplies",
+            "Automatic Replies",
+            "File › Info",
+            r#"{"account"?: number|string, "state"?: "off"|"on"|"scheduled", "start"?: "YYYY-MM-DDTHH:MM", "end"?: "YYYY-MM-DDTHH:MM", "insideReply"?: string, "outsideReply"?: string, "outside"?: "none"|"contacts"|"everyone", "dialog"?: bool} (Exchange accounts; no change = read them and open the dialog unless dialog is false)"#,
+            false,
+            has_exchange,
+            automatic_replies,
+        ),
         spec("file.cleanupTools", "Tools", "File › Info", "", false, always, cleanup_tools),
         spec(
             "file.newDataFile",
@@ -616,6 +625,19 @@ fn account_settings(s: &mut Session, p: &Value) -> CmdResult {
     let settings =
         s.mailbox.account(id).map(|a| crate::accounts::account_settings_json(s, a)).unwrap_or(Value::Null);
     dialog(s, "accountSettings", json!({"account": acct, "settings": settings}))
+}
+
+/// Automatic replies live on an Exchange server.
+fn has_exchange(s: &Session) -> Option<&'static str> {
+    if s.mailbox.accounts.iter().any(|a| a.kind == AccountKind::Exchange && a.incoming.is_some()) {
+        None
+    } else {
+        Some("Automatic replies need an Exchange account")
+    }
+}
+
+fn automatic_replies(s: &mut Session, p: &Value) -> CmdResult {
+    crate::sync::automatic_replies(s, p)
 }
 
 fn manage_rules(s: &mut Session, p: &Value) -> CmdResult {

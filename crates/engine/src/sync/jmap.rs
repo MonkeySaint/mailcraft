@@ -1267,14 +1267,8 @@ pub(crate) fn after_restore(s: &mut Session) {
         return;
     }
     let gone = &s.sync.track.mailboxes_gone;
-    // Graph folders the same way (their ids name folders removed from the service just as well).
-    let jmap: BTreeSet<AccountId> = s
-        .mailbox
-        .accounts
-        .iter()
-        .filter(|a| matches!(a.kind, AccountKind::Jmap | AccountKind::Graph))
-        .map(|a| a.id)
-        .collect();
+    let jmap: BTreeSet<AccountId> =
+        s.mailbox.accounts.iter().filter(|a| super::is_shadow_account(a.kind)).map(|a| a.id).collect();
     for f in s.mailbox.folders.values_mut() {
         if jmap.contains(&f.account)
             && f.kind == FolderKind::Mail

@@ -18,6 +18,11 @@
 //!    filtering service first has an MX record of that service). Without an MX answer (no resolver, as on
 //!    Windows; a failed lookup; no MX records) or with a null MX, the domain is not sent to Microsoft.
 //!
+//! 5. **Exchange Autodiscover** ([MS-OXDSCLI]), when nothing above found an incoming server: an unsigned
+//!    request at the domain's Autodiscover locations ([`crate::ews::autodiscover`]). Exchange servers answer
+//!    only signed-in requests, so this learns that an Exchange server answers ([`EwsFound::needs_sign_in`]);
+//!    the account setup finishes the lookup with the password.
+//!
 //! Servers found through DNS SRV outside the address's domain are marked unverified (RFC 6186 section 6):
 //! the account wizard shows them for confirmation like any other suggestion. A known provider's servers are
 //! its own hosts, whatever pointed at them, and count as verified, except when the provider is only known from
@@ -80,6 +85,11 @@ pub struct DiscoverOptions {
     pub tenant_url: Option<String>,
     /// Look up reserved test domains too (only for tests against local servers).
     pub allow_reserved: bool,
+    /// Exchange Autodiscover location templates (see [`crate::ews::autodiscover::AUTODISCOVER_URLS`]);
+    /// empty = no Autodiscover.
+    pub autodiscover_urls: Vec<String>,
+    /// The plain-HTTP Autodiscover redirect probe (see [`crate::ews::autodiscover::REDIRECT_PROBE_URL`]).
+    pub autodiscover_probe: Option<String>,
 }
 
 impl Default for DiscoverOptions {
@@ -95,6 +105,11 @@ impl Default for DiscoverOptions {
             },
             tenant_url: Some(TENANT_URL.to_owned()),
             allow_reserved: false,
+            autodiscover_urls: crate::ews::autodiscover::AUTODISCOVER_URLS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            autodiscover_probe: Some(crate::ews::autodiscover::REDIRECT_PROBE_URL.to_owned()),
         }
     }
 }
@@ -106,13 +121,34 @@ impl DiscoverOptions {
             resolver: ResolverChoice::Off,
             autoconfig_urls: Vec::new(),
             tenant_url: None,
+            autodiscover_urls: Vec::new(),
+            autodiscover_probe: None,
             ..Default::default()
+        }
+    }
+
+    /// The Autodiscover settings of these options (with `resolver` for the SRV record).
+    pub fn autodiscover(&self) -> crate::ews::autodiscover::AutodiscoverOptions {
+        crate::ews::autodiscover::AutodiscoverOptions {
+            urls: self.autodiscover_urls.clone(),
+            redirect_probe: self.autodiscover_probe.clone(),
+            resolver: match &self.resolver {
+                ResolverChoice::System => Resolver::system(),
+                ResolverChoice::Fixed(a) => Some(Resolver::new(*a)),
+                ResolverChoice::Off => None,
+            },
+            http: self.http.clone(),
+            confirmed_hosts: Vec::new(),
         }
     }
 
     /// True when discovery makes no network request at all with these options.
     pub fn is_offline(&self) -> bool {
-        self.resolver == ResolverChoice::Off && self.autoconfig_urls.is_empty() && self.tenant_url.is_none()
+        self.resolver == ResolverChoice::Off
+            && self.autoconfig_urls.is_empty()
+            && self.tenant_url.is_none()
+            && self.autodiscover_urls.is_empty()
+            && self.autodiscover_probe.is_none()
     }
 }
 
@@ -124,6 +160,19 @@ pub struct ProviderMatch {
     /// servers another source found) or `tenant` (the domain has a Microsoft 365 tenant but its MX records
     /// name another exchanger: a probable match, its servers unverified).
     pub by: &'static str,
+}
+
+/// An Exchange server that answered Autodiscover.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EwsFound {
+    /// The EWS URL, when the answer named one (Autodiscover answered without a sign-in).
+    pub url: Option<String>,
+    /// The Autodiscover location that answered.
+    pub autodiscover: String,
+    /// The server asked for a sign-in: the account setup looks again with the password.
+    pub needs_sign_in: bool,
+    /// The location is in the address's domain.
+    pub verified: bool,
 }
 
 /// What discovery found. Each protocol has at most one server (the preferred one).
@@ -140,6 +189,8 @@ pub struct Discovery {
     pub smtp: Option<ServerConfig>,
     /// JMAP session URL server (`host` is the URL).
     pub jmap: Option<ServerConfig>,
+    /// An Exchange server (EWS) found by Autodiscover.
+    pub ews: Option<EwsFound>,
     /// The well-known provider serving the address, if recognised.
     pub provider: Option<ProviderMatch>,
     /// The domain's mail exchangers (MX), most preferred first, when they were looked up.
@@ -152,7 +203,11 @@ pub struct Discovery {
 
 impl Discovery {
     pub fn found_anything(&self) -> bool {
-        self.imap.is_some() || self.pop3.is_some() || self.smtp.is_some() || self.jmap.is_some()
+        self.imap.is_some()
+            || self.pop3.is_some()
+            || self.smtp.is_some()
+            || self.jmap.is_some()
+            || self.ews.is_some()
     }
 
     /// An incoming server and an outgoing one are known.
@@ -501,6 +556,42 @@ pub fn discover(address: &str, o: &DiscoverOptions) -> Result<Discovery> {
             [&d.imap, &d.pop3, &d.smtp].into_iter().flatten().find_map(|s| providers::by_host(&s.host))
     {
         d.provider = Some(ProviderMatch { provider: p, by: "servers" });
+    }
+    // Exchange Autodiscover, when no incoming server is known yet and no well-known provider serves the domain.
+    if d.provider.is_none()
+        && d.imap.is_none()
+        && d.pop3.is_none()
+        && d.jmap.is_none()
+        && !o.autodiscover_urls.is_empty()
+    {
+        match crate::ews::autodiscover::autodiscover(&address, None, &o.autodiscover()) {
+            Ok(crate::ews::autodiscover::Probe::Found(f)) => {
+                // Both the Autodiscover location and the EWS server it names must be in the domain.
+                let verified = [&f.from, &f.ews_url]
+                    .iter()
+                    .all(|x| Url::parse(x).is_ok_and(|u| in_domain(&u.host, &domain)));
+                d.ews = Some(EwsFound {
+                    url: Some(f.ews_url),
+                    autodiscover: f.from,
+                    needs_sign_in: false,
+                    verified,
+                });
+                d.sources.push("autodiscover".into());
+            }
+            Ok(crate::ews::autodiscover::Probe::NeedsSignIn { url }) => {
+                let verified = Url::parse(&url).is_ok_and(|u| in_domain(&u.host, &domain));
+                d.ews = Some(EwsFound { url: None, autodiscover: url, needs_sign_in: true, verified });
+                d.sources.push("autodiscover".into());
+            }
+            // Only a signed-in lookup ends so.
+            Ok(crate::ews::autodiscover::Probe::Unconfirmed { url, .. }) => {
+                notes.push(format!("autodiscover: {url}"))
+            }
+            Ok(crate::ews::autodiscover::Probe::Nothing { notes: n }) => {
+                notes.extend(n.into_iter().take(6));
+            }
+            Err(e) => notes.push(format!("autodiscover: {e}")),
+        }
     }
     let microsoft = d.provider.is_some_and(|m| m.provider.id == ProviderId::Microsoft365);
     // Only the domain of a known Microsoft 365 organization, or one whose mail goes to an exchanger nobody

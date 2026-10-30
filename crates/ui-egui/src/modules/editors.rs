@@ -129,6 +129,8 @@ pub(crate) struct ApptEditor {
     pub page: u8,
     /// Day shown by the Scheduling Assistant (`None` = the meeting's day).
     pub scheduling_day: Option<i64>,
+    /// The attendees' busy times the Scheduling Assistant asked the Exchange server for (one day).
+    pub attendee_fb: Option<super::scheduling::AttendeeFreeBusy>,
     pub recurrence_dlg: Option<RecurrenceDialog>,
     pub error: Option<String>,
     pub nonce: u64,

@@ -109,6 +109,8 @@ fn discover_finds_settings_from_autoconfig_and_dns() {
         http: ConnectOptions::trusting(srv.cert_der.clone()),
         tenant_url: Some(srv.tenant_url_template()),
         allow_reserved: true,
+        autodiscover_urls: Vec::new(),
+        autodiscover_probe: None,
     };
     srv.set_autoconfig(
         "example.com",
@@ -168,6 +170,8 @@ fn microsoft_365_found_by_mx_and_signed_in_with_its_tenant() {
         http: ConnectOptions::trusting(srv.cert_der.clone()),
         tenant_url: Some(srv.tenant_url_template()),
         allow_reserved: true,
+        autodiscover_urls: Vec::new(),
+        autodiscover_probe: None,
     };
     // A domain on Microsoft 365: no autoconfig, no SRV records, the MX at Exchange Online.
     srv.set_mx(

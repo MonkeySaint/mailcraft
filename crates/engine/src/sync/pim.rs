@@ -809,6 +809,31 @@ pub fn is_jmap_url(url: &str) -> bool {
     url.trim().to_ascii_lowercase().starts_with(&format!("{JMAP_ORIGIN}/"))
 }
 
+/// Origin of the addresses an Exchange account's contacts, calendar and tasks folders and their items get
+/// (see `ews_pim.rs`; never reaches the network).
+pub const EWS_ORIGIN: &str = "https://ews.invalid";
+
+/// True for an address of an Exchange folder or item (see [`EWS_ORIGIN`]).
+pub fn is_ews_url(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with(&format!("{EWS_ORIGIN}/"))
+}
+
+/// True when `a` keeps `kind` on its Exchange server: an Exchange account whose settings name no DAV server.
+pub fn via_ews(a: &mailcraft_model::Account, _kind: PimKind) -> bool {
+    a.kind == mailcraft_model::AccountKind::Exchange && a.dav.as_ref().is_none_or(|d| d.url.trim().is_empty())
+}
+
+/// The protocol a collection address belongs to: 1 JMAP, 2 Exchange, 0 WebDAV.
+fn protocol_of(url: &str) -> u8 {
+    if is_jmap_url(url) {
+        1
+    } else if is_ews_url(url) {
+        2
+    } else {
+        0
+    }
+}
+
 /// True when `a` keeps `kind` on its JMAP server: a JMAP account whose server offers it and whose settings
 /// name no DAV server. An account with a DAV server keeps using it (its folders stay linked to what they
 /// synchronised with, and nothing is uploaded a second time where JMAP and DAV share one store); clearing
@@ -826,7 +851,9 @@ pub fn via_jmap(a: &mailcraft_model::Account, kind: PimKind) -> bool {
 
 /// True when `a` synchronises `kind` at all (over JMAP or with its DAV server).
 pub fn kind_on(a: &mailcraft_model::Account, kind: PimKind) -> bool {
-    via_jmap(a, kind) || a.dav.as_ref().is_some_and(|d| !d.url.trim().is_empty() && kind.enabled(d))
+    via_jmap(a, kind)
+        || via_ews(a, kind)
+        || a.dav.as_ref().is_some_and(|d| !d.url.trim().is_empty() && kind.enabled(d))
 }
 
 /// The folders of `account` that synchronise with its DAV server (or its JMAP server, [`via_jmap`]): the
@@ -862,8 +889,12 @@ pub fn folder_job(s: &Session, account: AccountId, folder: FolderId, kind: PimKi
     let state = s.mailbox.account(account).and_then(|a| a.sync.dav.get(&folder)).cloned();
     // A collection of the other protocol (the account switched between DAV and JMAP) counts as none: the
     // folder takes one of this protocol, and its items are matched with the server's like new ones.
-    let jmap = s.mailbox.account(account).is_some_and(|a| via_jmap(a, kind));
-    let state = state.filter(|st| st.collection.is_empty() || is_jmap_url(&st.collection) == jmap);
+    let want = match s.mailbox.account(account) {
+        Some(a) if via_jmap(a, kind) => 1,
+        Some(a) if via_ews(a, kind) => 2,
+        _ => 0,
+    };
+    let state = state.filter(|st| st.collection.is_empty() || protocol_of(&st.collection) == want);
     let collection = state.as_ref().map(|st| st.collection.clone()).filter(|c| !c.is_empty());
     let known = state.map(|st| st.known).unwrap_or_default();
     let now = s.now();

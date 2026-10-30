@@ -641,6 +641,34 @@ pub struct GraphState {
     pub listed: bool,
 }
 
+/// What the client last knew of an Exchange item (to find local changes): its folder and flags.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EwsShadow {
+    pub folder: String,
+    pub read: bool,
+    /// PidTagFlagStatus: 0 none, 1 complete, 2 flagged.
+    pub flag: i64,
+    /// Sorted.
+    pub categories: Vec<String>,
+    /// PidTagLastVerbExecuted (102 reply, 103 reply all, 104 forward).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verb: Option<i64>,
+}
+
+/// Exchange (EWS) bookkeeping of one account.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EwsState {
+    /// SyncFolderHierarchy state.
+    pub hierarchy_state: String,
+    /// SyncFolderItems state per server folder.
+    pub item_states: BTreeMap<String, String>,
+    pub shadow: BTreeMap<String, EwsShadow>,
+    /// Folder id → what the client last knew of it (folders without a role).
+    pub folders: BTreeMap<String, JmapFolderShadow>,
+}
+
 /// Everything in [`ACCOUNT_OPTIONS_FILE`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -657,6 +685,7 @@ pub struct AccountPrefs {
     pub jmap: BTreeMap<u32, JmapState>,
     /// Microsoft Graph accounts' delta links and shadows (`sync/graph.rs`).
     pub graph: BTreeMap<u32, GraphState>,
+    pub ews: BTreeMap<u32, EwsState>,
     /// User-defined Send/Receive groups (`sync/groups.rs`).
     pub groups: Vec<crate::sync::groups::SendReceiveGroup>,
 }
@@ -769,7 +798,8 @@ pub(crate) fn forget_options(s: &mut Session, id: AccountId) {
     let mut had = p.accounts.remove(&id.0).is_some()
         | p.pop3.remove(&id.0).is_some()
         | p.jmap.remove(&id.0).is_some()
-        | p.graph.remove(&id.0).is_some();
+        | p.graph.remove(&id.0).is_some()
+        | p.ews.remove(&id.0).is_some();
     for g in &mut p.groups {
         let n = g.members.len();
         g.members.retain(|m| m.account != id.0);
@@ -930,7 +960,7 @@ pub fn specs() -> Vec<CommandSpec> {
         spec(
             "accounts.add",
             "Add Account",
-            r#"{"kind": "imap"|"pop3"|"jmap"|"graph", "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string, "password"?: string (a DAV password of its own; empty removes it), "extraRootPem"?: string, "allowPlaintextAuth"?: bool}|null} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL; graph = Microsoft 365 / Outlook.com through Microsoft Graph: incoming optional, its host the API base, default https://graph.microsoft.com/v1.0, no outgoing; sign in with accounts.oauthSignIn, provider microsoft)"#,
+            r#"{"kind": "imap"|"pop3"|"jmap"|"graph"|"exchange", "autodiscover"?: bool (Exchange: find the EWS address with the password; then `incoming` may leave out `host`; an Autodiscover or EWS host outside the address's domain answers {"needsConfirm": true, "confirmHost"} without adding the account), "autodiscoverHosts"?: [host] (hosts outside the domain the password may go to), "address": string, "displayName"?: string, "senderName"?: string, "incoming": server, "outgoing"?: server, "password"?: string, "outgoingPassword"?: string, "oauthToken"?: string, "default"?: bool, "serverSavesSent"?: bool, "dav"?: {"url": "https://… (server, principal or collection)", "contacts"?: bool, "tasks"?: bool, "calendar"?: bool (events, CalDAV VEVENT), "publishUrl"?: "https://… (WebDAV collection for published calendars)", "username"?: string, "password"?: string (a DAV password of its own; empty removes it), "extraRootPem"?: string, "allowPlaintextAuth"?: bool}|null} where server = {"host", "port"?, "security"?, "username"?, "auth"?, "extraRootPem"?, "allowPlaintextAuth"?} (JMAP: host = session URL; graph = Microsoft 365 / Outlook.com through Microsoft Graph: incoming optional, its host the API base, default https://graph.microsoft.com/v1.0, no outgoing; sign in with accounts.oauthSignIn, provider microsoft; Exchange: host = EWS URL or server name, auth = ""|"basic"|"ntlm", username may be DOMAIN\user)"#,
             true,
             always,
             add,
@@ -1390,11 +1420,19 @@ fn parse_server(
     if host.is_empty() {
         return Err(CmdError::Params("`host` (server name) required".into()));
     }
-    if kind == AccountKind::Imap && host.contains(char::is_whitespace) {
+    if matches!(kind, AccountKind::Imap | AccountKind::Exchange) && host.contains(char::is_whitespace) {
         return Err(CmdError::Params("the server name cannot contain spaces".into()));
+    }
+    // Exchange: a server name or an HTTPS address (the password never goes over plain HTTP).
+    if kind == AccountKind::Exchange
+        && host.contains("://")
+        && !host.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+    {
+        return Err(CmdError::Params("the EWS address must start with https://".into()));
     }
     let security = parse_security(v.get("security"), old.map_or(Security::Tls, |o| o.security))?;
     let default_port = match (smtp, security) {
+        _ if kind == AccountKind::Exchange => 443,
         (false, Security::Tls) if pop3 => 995,
         (false, _) if pop3 => 110,
         (false, Security::Tls) => 993,
@@ -1445,10 +1483,13 @@ fn parse_kind(p: &Value) -> Result<(AccountKind, bool), CmdError> {
         Some("pop3" | "pop") => Ok((AccountKind::Imap, true)),
         Some("jmap") => Ok((AccountKind::Jmap, false)),
         Some("graph" | "microsoft365" | "microsoft-graph") => Ok((AccountKind::Graph, false)),
-        Some(other) => {
-            Err(CmdError::Params(format!("unknown account kind `{other}` (imap, pop3, jmap or graph)")))
-        }
-        None => Err(CmdError::Params("`kind` (\"imap\", \"pop3\", \"jmap\" or \"graph\") required".into())),
+        Some("ews" | "exchange") => Ok((AccountKind::Exchange, false)),
+        Some(other) => Err(CmdError::Params(format!(
+            "unknown account kind `{other}` (imap, pop3, jmap, graph or exchange)"
+        ))),
+        None => Err(CmdError::Params(
+            "`kind` (\"imap\", \"pop3\", \"jmap\", \"graph\" or \"exchange\") required".into(),
+        )),
     }
 }
 
@@ -1513,14 +1554,51 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         Some(n) => clean_line("your name", n)?,
         None => String::new(),
     };
+    let (secret_in, secret_out, cred) = parse_secrets(p)?;
+    let auto = kind == AccountKind::Exchange && opt_bool(p, "autodiscover").unwrap_or(false);
     // A Graph account needs no server name: the global Microsoft Graph endpoint unless told otherwise.
     let graph_default = json!({ "host": GRAPH_BASE });
-    let incoming_v = match field(p, &["incoming"]) {
-        Some(v) => v,
-        None if kind == AccountKind::Graph => &graph_default,
-        None => return Err(CmdError::Params("`incoming` server required".into())),
+    let incoming = if auto {
+        // Exchange: the EWS address from Autodiscover, signed in with the password given.
+        let given = field(p, &["incoming"]).cloned().unwrap_or_else(|| json!({}));
+        let password =
+            secret_in.clone().ok_or_else(|| CmdError::Params("Autodiscover needs the password".into()))?;
+        let confirmed: Vec<String> = match field(p, &["autodiscoverHosts"]) {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .take(16)
+                .map(|h| h.as_str().map(|h| h.trim().to_owned()).filter(|h| !h.is_empty() && h.len() <= 253))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| CmdError::Params("`autodiscoverHosts` takes host names".into()))?,
+            Some(_) => return Err(CmdError::Params("`autodiscoverHosts` takes a list of host names".into())),
+        };
+        let url = match autodiscover_ews(s, &address, &given, &password, confirmed)? {
+            Ok(url) => url,
+            Err((host, url)) => {
+                // The password goes to a host outside the address's domain only once the user agreed.
+                let message = format!(
+                    "Autodiscover for {address} leads to {host}, which is not part of {}. Use it only if your \
+                     email provider told you to.",
+                    address.rsplit_once('@').map(|(_, d)| d).unwrap_or_default()
+                );
+                return Ok(json!({"added": false, "needsConfirm": true, "confirmHost": host, "url": url,
+                                 "message": message}));
+            }
+        };
+        let mut v = given;
+        if let Some(o) = v.as_object_mut() {
+            o.insert("host".into(), json!(url));
+        }
+        parse_server(&v, kind, false, pop3, &address, None)?
+    } else {
+        let incoming_v = match field(p, &["incoming"]) {
+            Some(v) => v,
+            None if kind == AccountKind::Graph => &graph_default,
+            None => return Err(CmdError::Params("`incoming` server required".into())),
+        };
+        parse_server(incoming_v, kind, false, pop3, &address, None)?
     };
-    let incoming = parse_server(incoming_v, kind, false, pop3, &address, None)?;
     if kind == AccountKind::Graph && !graph_url_ok(&incoming) {
         return Err(CmdError::Params(GRAPH_URL_NEEDED.into()));
     }
@@ -1529,7 +1607,6 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         Some(v) => Some(parse_server(v, kind, true, false, &address, None)?),
         None => None,
     };
-    let (secret_in, secret_out, cred) = parse_secrets(p)?;
     load_prefs(s);
     let mut opts = s.sync.prefs.data.defaults.clone();
     opts.pop3 = pop3;
@@ -1549,7 +1626,8 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         outgoing,
         is_default: make_default,
         credential: cred.unwrap_or_default(),
-        server_saves_sent: opt_bool(p, "serverSavesSent").unwrap_or(false),
+        // An Exchange server files the sent copy itself (SendAndSaveCopy).
+        server_saves_sent: opt_bool(p, "serverSavesSent").unwrap_or(kind == AccountKind::Exchange),
         dav,
         ..Default::default()
     });
@@ -1563,6 +1641,7 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     prefs(s).pop3.remove(&id.0);
     prefs(s).jmap.remove(&id.0);
     prefs(s).graph.remove(&id.0);
+    prefs(s).ews.remove(&id.0);
     update_options(s, id, |o| *o = opts);
     store_secrets(s, id, secret_in, secret_out)?;
     store_dav_password(s, id, dav_password)?;
@@ -1583,6 +1662,57 @@ fn graph_url_ok(srv: &ServerSettings) -> bool {
     let h = srv.host.trim().to_ascii_lowercase();
     (h.starts_with("https://") || (h.starts_with("http://") && srv.allow_plaintext_auth))
         && !h.contains(char::is_whitespace)
+}
+
+/// The EWS URL of `address` from Autodiscover, signed in with `password` (and the user name and certificate
+/// of `incoming`, when given), or `Err((host, url))` for a host outside the domain the user has to confirm
+/// (`confirmed`: the hosts already confirmed).
+#[cfg(not(target_arch = "wasm32"))]
+fn autodiscover_ews(
+    s: &Session,
+    address: &str,
+    incoming: &Value,
+    password: &str,
+    confirmed: Vec<String>,
+) -> Result<Result<String, (String, String)>, CmdError> {
+    use mailcraft_net::ews::autodiscover::{Probe, autodiscover};
+    let user =
+        incoming.get("username").and_then(Value::as_str).filter(|u| !u.trim().is_empty()).unwrap_or(address);
+    let mechanism = incoming.get("auth").and_then(Value::as_str).unwrap_or_default();
+    let signer = mailcraft_net::ews::Signer::new(mailcraft_net::ews::EwsAuth::from_mechanism(
+        mechanism, user, password,
+    ));
+    let mut o = s.sync.discovery.autodiscover();
+    if o.urls.is_empty() {
+        o.urls =
+            mailcraft_net::ews::autodiscover::AUTODISCOVER_URLS.iter().map(|u| (*u).to_owned()).collect();
+    }
+    if let Some(pem) = incoming.get("extraRootPem").and_then(Value::as_str).filter(|p| !p.trim().is_empty()) {
+        o.http.tls.extra_roots_der.extend(pem_certificates(pem).map_err(CmdError::Params)?);
+    }
+    o.confirmed_hosts.extend(confirmed);
+    match autodiscover(address, Some(&signer), &o) {
+        Ok(Probe::Found(f)) => Ok(Ok(f.ews_url)),
+        Ok(Probe::Unconfirmed { url, host }) => Ok(Err((host, url))),
+        Ok(Probe::NeedsSignIn { .. }) => {
+            Err(CmdError::Failed("Autodiscover did not accept the sign-in.".into()))
+        }
+        Ok(Probe::Nothing { .. }) => Err(CmdError::Failed(format!(
+            "No Exchange server answered Autodiscover for {address}. Enter the server's EWS address instead."
+        ))),
+        Err(e) => Err(CmdError::Failed(format!("Autodiscover: {e}"))),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn autodiscover_ews(
+    _: &Session,
+    _: &str,
+    _: &Value,
+    _: &str,
+    _: Vec<String>,
+) -> Result<Result<String, (String, String)>, CmdError> {
+    Err(CmdError::Disabled("Exchange accounts need the desktop app".into()))
 }
 
 fn edit(s: &mut Session, p: &Value) -> CmdResult {
@@ -1675,6 +1805,7 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
         prefs(s).pop3.remove(&id.0);
         prefs(s).jmap.remove(&id.0);
         prefs(s).graph.remove(&id.0);
+        prefs(s).ews.remove(&id.0);
     }
     if dav_reset {
         forget_dav(s, id);
@@ -2130,7 +2261,8 @@ mod tests {
     fn add_validates() {
         let (mut s, _, _) = session();
         for bad in [
-            json!({"kind": "exchange", "address": "a@example.com", "incoming": {"host": "h"}}),
+            json!({"kind": "exchange", "address": "a@example.com", "incoming": {"host": "http://h/EWS/Exchange.asmx"}}),
+            json!({"kind": "exchange", "address": "a@example.com", "autodiscover": true, "incoming": {}}),
             json!({"kind": "imap", "address": "nope", "incoming": {"host": "h"}}),
             json!({"kind": "imap", "address": "a@example.com"}),
             json!({"kind": "imap", "address": "a@example.com", "incoming": {"host": ""}}),

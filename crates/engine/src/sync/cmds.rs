@@ -101,7 +101,8 @@ pub fn slow_headers_only(s: &Session) -> bool {
 
 fn server_account(s: &Session, id: AccountId) -> bool {
     s.mailbox.account(id).is_some_and(|a| {
-        matches!(a.kind, AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph) && a.incoming.is_some()
+        matches!(a.kind, AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph | AccountKind::Exchange)
+            && a.incoming.is_some()
     })
 }
 

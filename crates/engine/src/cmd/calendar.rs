@@ -3249,7 +3249,23 @@ fn run_free_busy(s: &mut Session, p: &Value) -> CmdResult {
     }
     let exclude = opt_u64(p, "exclude").map(ItemId);
     let busy = free_busy(s, from, to, exclude, None);
-    Ok(json!({ "busy": busy }))
+    let mut out = json!({ "busy": busy });
+    // Other people's busy times, from the Exchange server (GetUserAvailability).
+    if let Some(list) = p.get("attendees").and_then(Value::as_array) {
+        let addresses: Vec<String> = list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|a| a.trim().to_owned())
+            .filter(|a| a.contains('@'))
+            .collect();
+        if !addresses.is_empty()
+            && let Some(v) = crate::sync::attendee_availability(s, &addresses, from.unix, to.unix)
+            && let Some(o) = out.as_object_mut()
+        {
+            o.insert("attendees".into(), v);
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -3810,11 +3826,31 @@ fn run_respond(s: &mut Session, p: &Value) -> CmdResult {
     let response = parse_response(p)?;
     let mode = send_mode(p, SendMode::Now)?;
     let comment = pim::text(p, "comment")?.unwrap_or_default();
+    // Here first: when that fails (a read-only calendar, no address to answer from) nothing has reached the
+    // organizer or the server, and a retry answers once.
     let (item, answered, me) = apply_response(s, mail, &msg, response)?;
+    // A request kept on an Exchange server is answered there (the server updates its calendar and tells the
+    // organizer); one the server cannot answer gets the usual reply mail.
+    let by_server = mode != SendMode::Edit
+        && match crate::sync::exchange_meeting_reply(
+            s,
+            mail,
+            response_name(response),
+            mode == SendMode::Now,
+            &comment,
+        ) {
+            Ok(done) => done,
+            Err(e) => {
+                log::warn!(
+                    "meeting answer through the Exchange server failed ({e}); a reply mail goes instead"
+                );
+                false
+            }
+        };
     let organizer = answered.organizer.clone();
     let mut compose = None;
-    let mut sent = false;
-    if let Some(org) = organizer.filter(|_| mode != SendMode::None) {
+    let mut sent = by_server && mode == SendMode::Now;
+    if let Some(org) = organizer.filter(|_| mode != SendMode::None && !by_server) {
         let ics = itip::reply(&answered, &me, response, msg.event.sequence, s.now());
         let subject = response_subject(response, &answered.subject);
         (compose, sent) = itip_compose(s, org.to_display_string(), subject, &comment, "REPLY", ics, mode)?;
@@ -4447,7 +4483,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Scheduling Assistant",
             "Meeting › Show",
             "",
-            r#"{"start"?: "YYYY-MM-DDTHH:MM", "end"?: "YYYY-MM-DDTHH:MM", "exclude"?: number}"#,
+            r#"{"start"?: "YYYY-MM-DDTHH:MM", "end"?: "YYYY-MM-DDTHH:MM", "exclude"?: number, "attendees"?: [string] (Exchange: their busy times from the server)}"#,
             false,
             run_free_busy,
         ),

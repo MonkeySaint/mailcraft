@@ -181,9 +181,69 @@ fn client_config(opts: &TlsOptions) -> Result<Arc<ClientConfig>> {
         if roots.is_empty() {
             return Err(NetError::Tls("no trusted root certificates are available".into()));
         }
-        builder.with_root_certificates(roots).with_no_client_auth()
+        if opts.extra_roots_der.is_empty() {
+            builder.with_root_certificates(roots).with_no_client_auth()
+        } else {
+            let inner =
+                rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                    .build()
+                    .map_err(|e| NetError::Tls(format!("certificate checks: {e}")))?;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(ExactOrChain {
+                    inner,
+                    exact: opts.extra_roots_der.clone(),
+                }))
+                .with_no_client_auth()
+        }
     };
     Ok(Arc::new(config))
+}
+
+/// The usual chain checks, except that a server presenting exactly a certificate the user trusted (a
+/// self-signed one, which may be marked as a CA and so is refused as an end-entity certificate by the chain
+/// checks) is accepted when the certificate names the server. The handshake signatures are always checked.
+#[derive(Debug)]
+struct ExactOrChain {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    exact: Vec<Vec<u8>>,
+}
+
+impl ServerCertVerifier for ExactOrChain {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        if self.exact.iter().any(|d| d.as_slice() == end_entity.as_ref()) {
+            let parsed = rustls::server::ParsedCertificate::try_from(end_entity)?;
+            rustls::client::verify_server_name(&parsed, server_name)?;
+            return Ok(ServerCertVerified::assertion());
+        }
+        self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
 }
 
 /// Certificate verifier that accepts any certificate but still checks handshake signatures.
@@ -240,6 +300,25 @@ fn tls_wrap(sock: Sock, host: &str, opts: &TlsOptions) -> Result<Stream> {
     Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, sock))))
 }
 
+/// Host names connected to at a fixed address instead of the one DNS gives (see [`set_host_address`]).
+fn host_addresses() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, std::net::IpAddr>> {
+    static H: OnceLock<std::sync::Mutex<std::collections::BTreeMap<String, std::net::IpAddr>>> =
+        OnceLock::new();
+    H.get_or_init(Default::default)
+}
+
+/// Connects to `host` at `ip` from now on, in this process (`None` goes back to DNS), like a hosts-file
+/// entry: the certificate is still checked against `host`. For tests against a server known by a name no
+/// resolver here knows (a test machine on a private network) and for diagnosing a server's address.
+pub fn set_host_address(host: &str, ip: Option<std::net::IpAddr>) {
+    let key = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let mut map = host_addresses().lock().unwrap_or_else(|e| e.into_inner());
+    match ip {
+        Some(ip) => map.insert(key, ip),
+        None => map.remove(&key),
+    };
+}
+
 impl Conn {
     /// Connects to `host:port`; `implicit_tls` starts TLS immediately (IMAPS 993, SMTPS 465, HTTPS).
     pub fn connect(host: &str, port: u16, implicit_tls: bool, opts: &ConnectOptions) -> Result<Conn> {
@@ -259,8 +338,18 @@ impl Conn {
             return Err(NetError::Invalid("empty host name".into()));
         }
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        let addrs: Vec<_> =
-            (bare, port).to_socket_addrs().map_err(|e| NetError::Connect(format!("{host}: {e}")))?.collect();
+        let fixed = host_addresses()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&bare.to_ascii_lowercase())
+            .copied();
+        let addrs: Vec<_> = match fixed {
+            Some(ip) => vec![std::net::SocketAddr::new(ip, port)],
+            None => (bare, port)
+                .to_socket_addrs()
+                .map_err(|e| NetError::Connect(format!("{host}: {e}")))?
+                .collect(),
+        };
         // The addresses checked are the ones connected to, so a later lookup cannot change the answer.
         if opts.loopback_only && addrs.iter().any(|a| !a.ip().is_loopback()) {
             return Err(NetError::Insecure(format!(

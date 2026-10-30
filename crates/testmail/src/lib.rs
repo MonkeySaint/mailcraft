@@ -36,6 +36,10 @@
 //!   responder (UDP) answering SRV and MX questions from records the test sets. Nothing is ever forwarded to
 //!   a real server.
 //!
+//! - a fake Exchange Web Services endpoint (SOAP: folders, SyncFolderItems, MIME items, sending, contacts,
+//!   events, tasks, automatic replies, availability; Basic, Bearer and NTLM sign-in) and Autodiscover on
+//!   the web server's ports (`ews.rs`).
+//!
 //! Each protocol listens on a plain port (with STARTTLS) and an implicit-TLS port. TLS uses a self-signed
 //! certificate for `localhost`/`127.0.0.1` generated at start; [`TestServers::cert_pem`] /
 //! [`TestServers::cert_der`] let test clients trust it. All state is in memory and shared by both servers.
@@ -45,6 +49,7 @@ mod conn;
 mod date;
 mod dav;
 mod dns;
+pub mod ews;
 mod graph;
 mod imap;
 mod jmap;
@@ -156,6 +161,8 @@ pub struct Config {
     /// Largest page the fake Graph service sends (the client's `Prefer: odata.maxpagesize` is honoured up to
     /// this), so paging is exercised with little mail.
     pub graph_max_page: usize,
+    /// Exchange Web Services accept only NTLM sign-ins (Basic is refused and not offered).
+    pub ews_ntlm_only: bool,
 }
 
 impl Default for Config {
@@ -190,6 +197,7 @@ impl Default for Config {
             jmap_pim: false,
             jmap_refuse_roles: false,
             graph_max_page: 50,
+            ews_ntlm_only: false,
         }
     }
 }
@@ -327,6 +335,79 @@ impl TestServers {
             Some(x) => w.autoconfig.insert(key, (x.to_owned(), both)),
             None => w.autoconfig.remove(&key),
         };
+    }
+
+    /// The EWS endpoint over HTTPS (`https://127.0.0.1:<webs_port>/EWS/Exchange.asmx`).
+    pub fn ews_url(&self) -> String {
+        format!("{}/EWS/Exchange.asmx", self.web_url())
+    }
+
+    /// Autodiscover location templates (`{domain}` placeholder) pointing at this server, standing in for
+    /// `https://<domain>/autodiscover/autodiscover.xml` and `https://autodiscover.<domain>/…`.
+    pub fn autodiscover_url_templates(&self) -> Vec<String> {
+        let base = self.web_url();
+        vec![
+            format!("{base}/{{domain}}/autodiscover/autodiscover.xml"),
+            format!("{base}/autodiscover.{{domain}}/autodiscover/autodiscover.xml"),
+        ]
+    }
+
+    /// Makes Autodiscover answer (signed in) for addresses of `domain`, or stop answering (404).
+    pub fn set_autodiscover(&self, domain: &str, on: bool) {
+        let mut st = self.ews_state();
+        let d = domain.trim().to_ascii_lowercase();
+        st.autodiscover.retain(|x| *x != d);
+        if on {
+            st.autodiscover.push(d);
+        }
+    }
+
+    fn ews_state(&self) -> std::sync::MutexGuard<'_, ews::EwsState> {
+        self.inner.ctx.ews.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stores an EWS item (the XML of a `CalendarItem`, `Contact` or `Task` element) in `user`'s `folder`
+    /// (`calendar`, `contacts` or `tasks`); its item id, `None` when the XML does not parse.
+    pub fn ews_put_item(&self, user: &str, folder: &str, xml: &str) -> Option<String> {
+        ews::put_item(&mut self.ews_state(), user, folder, xml)
+    }
+
+    /// The EWS items of `user`'s `folder`: (item id, XML).
+    pub fn ews_items(&self, user: &str, folder: &str) -> Vec<(String, String)> {
+        ews::items(&self.ews_state(), user, folder)
+    }
+
+    /// Sets field `name` of an EWS item to `text` (as another client's edit); false for an unknown item.
+    pub fn ews_set_item_field(&self, user: &str, id: &str, name: &str, text: &str) -> bool {
+        ews::set_item_field(&mut self.ews_state(), user, id, name, text)
+    }
+
+    /// Removes an EWS item (as another client would).
+    pub fn ews_remove_item(&self, user: &str, id: &str) -> bool {
+        ews::remove_item(&mut self.ews_state(), user, id)
+    }
+
+    /// `user`'s automatic-reply settings as last set over EWS.
+    pub fn ews_oof(&self, user: &str) -> Option<ews::Oof> {
+        self.ews_state().oof.get(&user.trim().to_ascii_lowercase()).cloned()
+    }
+
+    /// Meeting answers sent over EWS: (user, `AcceptItem`/`TentativelyAcceptItem`/`DeclineItem`, item id).
+    pub fn ews_replies(&self) -> Vec<(String, String, String)> {
+        self.ews_state().replies.clone()
+    }
+
+    /// Makes EWS refuse to store messages (CreateItem SaveOnly) larger than `bytes` with
+    /// ErrorMessageSizeExceeded (`None`: no limit).
+    pub fn ews_set_max_upload(&self, bytes: Option<usize>) {
+        self.ews_state().max_upload = bytes;
+    }
+
+    /// EWS operations served, oldest first, each with how it was signed in ("GetFolder basic",
+    /// "SyncFolderItems ntlm", "GetItem conn" for a request on an NTLM-signed-in connection; Autodiscover
+    /// requests as "autodiscover auth=<scheme or none>").
+    pub fn ews_log(&self) -> Vec<String> {
+        self.ews_state().log.clone()
     }
 
     /// Requests the web server received ("GET /path?query"), oldest first.
@@ -579,6 +660,18 @@ impl TestServers {
         let mut d = self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner());
         d.ensure(user);
         d.collection_mut(user, collection).is_some_and(|c| c.items.remove(name).is_some())
+    }
+
+    /// Makes the DAV server store each new resource under a name of its own choosing (`srv-<n>.vcf`) instead of
+    /// the one the client PUT, as some servers do.
+    pub fn set_dav_rename_new(&self, on: bool) {
+        self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).rename_new = on;
+    }
+
+    /// Gives every resource written the same ETag `etag` (`None`: a new one per write), as servers whose ETag
+    /// is a version counter starting alike for each new resource.
+    pub fn set_dav_constant_etag(&self, etag: Option<&str>) {
+        self.inner.ctx.dav.lock().unwrap_or_else(|e| e.into_inner()).constant_etag = etag.map(str::to_owned);
     }
 
     /// Makes the DAV server answer PUT with (`true`, the default) or without an ETag.

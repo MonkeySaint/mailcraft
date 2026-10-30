@@ -286,6 +286,11 @@ impl Store {
         address.trim().to_ascii_lowercase()
     }
 
+    /// Every user's address.
+    pub fn user_addresses(&self) -> Vec<String> {
+        self.users.values().map(|u| u.address.clone()).collect()
+    }
+
     pub fn user(&self, address: &str) -> Option<&User> {
         self.users.get(&Self::key(address))
     }

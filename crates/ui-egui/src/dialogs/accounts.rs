@@ -763,6 +763,8 @@ struct Wizard {
     jmap: bool,
     /// A Microsoft 365 / Outlook.com mailbox through Microsoft Graph (OAuth sign-in, no SMTP).
     graph: bool,
+    /// An Exchange (EWS) account: one server URL, found by Autodiscover when left empty.
+    ews: bool,
     /// Incoming mail over POP3.
     pop3: bool,
     extra: Extra,
@@ -807,6 +809,11 @@ struct Wizard {
     /// A new lookup result: the OAuth section is opened (and its provider chosen) once for it, not again
     /// each time the account type changes, so a user's own choice there stays.
     oauth_preselect: bool,
+    /// Exchange Autodiscover led to this host outside the address's domain: the password goes there only
+    /// once the user agrees.
+    ad_ask: Option<String>,
+    /// Hosts outside the domain the user agreed to (sent as `autodiscoverHosts`).
+    ad_hosts: Vec<String>,
     error: String,
 }
 
@@ -829,6 +836,9 @@ impl Wizard {
             mailcraft_engine::accounts::GRAPH_BASE.clone_into(&mut self.in_host);
             // Graph takes no password: the sign-in is the OAuth section's.
             self.extra.oauth_open = true;
+        } else if self.ews {
+            // Empty: Autodiscover finds the EWS address when the account is added.
+            self.in_host.clear();
         } else if self.jmap {
             self.in_host = format!("https://{domain}/.well-known/jmap");
         } else {
@@ -847,6 +857,9 @@ impl Wizard {
         self.guessed = true;
         self.found_in.clear();
         self.unverified.clear();
+        // A host agreed to for another address does not carry over.
+        self.ad_ask = None;
+        self.ad_hosts.clear();
         self.provider_notes.clear();
         self.oauth_hint = None;
         self.tenant = None;
@@ -859,7 +872,9 @@ impl Wizard {
     /// Fills in what `accounts.discover` found for the chosen account type (over the guesses).
     fn apply_discovered(&mut self, d: &Value) {
         let provider = d.get("provider").filter(|v| v.is_object());
-        let incoming = if self.jmap {
+        let incoming = if self.ews {
+            "ews"
+        } else if self.jmap {
             "jmap"
         } else if self.pop3 {
             "pop3"
@@ -907,6 +922,13 @@ impl Wizard {
         };
         if self.graph {
             // The global endpoint (set by `guess`); the sign-in is the OAuth section's.
+        } else if self.ews {
+            // Found without signing in only when the server answers unauthenticated; else Autodiscover runs
+            // again with the password when the account is added.
+            if let Some(url) = inc.get("url").and_then(Value::as_str) {
+                self.in_host = url.to_owned();
+                note(inc, url);
+            }
         } else if self.jmap {
             let Some(url) = inc.get("url").and_then(Value::as_str) else { return };
             self.in_host = url.to_owned();
@@ -979,10 +1001,12 @@ impl Wizard {
     }
 
     /// The account type to start with when the lookup found something: Microsoft Graph for a provider Graph
-    /// serves (Microsoft 365 and Outlook.com: the lookup's `provider.graph`), else IMAP, else POP, else JMAP.
+    /// serves (Microsoft 365 and Outlook.com: the lookup's `provider.graph`), else IMAP, else POP, else JMAP,
+    /// else Exchange (EWS, its Autodiscover answered).
     fn kind_from_discovery(&mut self) {
         let has = |k: &str| self.discovered.as_ref().is_some_and(|d| d.get(k).is_some_and(Value::is_object));
         self.jmap = false;
+        self.ews = false;
         self.pop3 = false;
         self.graph = self.discovered.as_ref().is_some_and(|d| {
             d.get("provider").and_then(|p| p.get("graph")).and_then(Value::as_bool) == Some(true)
@@ -995,6 +1019,8 @@ impl Wizard {
                 self.pop3 = true;
             } else if has("jmap") {
                 self.jmap = true;
+            } else if has("ews") {
+                self.ews = true;
             }
         }
     }
@@ -1015,9 +1041,17 @@ impl Wizard {
         }
     }
 
+    /// One server URL for reading and sending (JMAP, Graph, Exchange): no SMTP server, no offline IMAP
+    /// settings.
+    fn url_only(&self) -> bool {
+        self.jmap || self.graph || self.ews
+    }
+
     fn kind_name(&self) -> &'static str {
         if self.graph {
             "Microsoft 365"
+        } else if self.ews {
+            "Exchange"
         } else if self.jmap {
             "JMAP"
         } else if self.pop3 {
@@ -1032,6 +1066,7 @@ impl Wizard {
     fn fill_from(&mut self, app: &App, a: &Account) {
         self.jmap = a.kind == AccountKind::Jmap;
         self.graph = a.kind == AccountKind::Graph;
+        self.ews = a.kind == AccountKind::Exchange;
         self.pop3 = mailcraft_engine::accounts::kind_label(&app.s, a) == "pop3";
         self.extra = Extra::from_options(&mailcraft_engine::accounts::account_options(&app.s, a.id));
         self.extra.fill_dav(a.dav.as_ref());
@@ -1066,9 +1101,9 @@ impl Wizard {
         }
     }
 
-    /// A server is set to encryption None (JMAP and Graph: an `http:` URL).
+    /// A server is set to encryption None (JMAP, Graph, Exchange: an `http:` URL).
     fn unencrypted(&self) -> bool {
-        if self.jmap || self.graph {
+        if self.url_only() {
             return self.in_host.trim().to_ascii_lowercase().starts_with("http:");
         }
         security_name(self.in_sec) == "none" || security_name(self.out_sec) == "none"
@@ -1076,8 +1111,8 @@ impl Wizard {
 
     fn settings_ok(&self) -> bool {
         self.address_ok()
-            && !self.in_host.trim().is_empty()
-            && (self.jmap || self.graph || !self.out_host.trim().is_empty())
+            && (!self.in_host.trim().is_empty() || (self.ews && self.change.is_none()))
+            && (self.url_only() || !self.out_host.trim().is_empty())
             && (self.change.is_some()
                 || self.created.is_some()
                 || !self.password.is_empty()
@@ -1105,7 +1140,7 @@ impl Wizard {
         } else {
             o.insert("push".into(), json!(e.push));
         }
-        if !self.pop3 && !self.jmap && !self.graph {
+        if !self.pop3 && !self.url_only() {
             o.insert("keepOffline".into(), json!(e.keep_offline));
             let window = OfflineWindow::from_index(e.offline_window).unwrap_or_default();
             o.insert("offlineWindow".into(), json!(window.key()));
@@ -1117,7 +1152,7 @@ impl Wizard {
     fn params(&self, account: Option<u32>) -> Value {
         let user = if self.in_user.trim().is_empty() { self.address.trim() } else { self.in_user.trim() };
         let mut p = json!({
-            "kind": if self.graph { "graph" } else if self.jmap { "jmap" } else if self.pop3 { "pop3" } else { "imap" },
+            "kind": if self.graph { "graph" } else if self.ews { "exchange" } else if self.jmap { "jmap" } else if self.pop3 { "pop3" } else { "imap" },
             "address": self.address.trim(),
             "senderName": self.name.trim(),
             "incoming": {
@@ -1126,14 +1161,20 @@ impl Wizard {
                 "security": security_name(self.in_sec),
                 "username": user,
                 "allowPlaintextAuth": self.allow_plain
-                    && if self.jmap || self.graph { self.unencrypted() } else { security_name(self.in_sec) == "none" },
+                    && if self.url_only() { self.unencrypted() } else { security_name(self.in_sec) == "none" },
             },
         });
         let Some(o) = p.as_object_mut() else { return p };
+        if self.ews && account.is_none() && self.in_host.trim().is_empty() {
+            o.insert("autodiscover".into(), json!(true));
+            if !self.ad_hosts.is_empty() {
+                o.insert("autodiscoverHosts".into(), json!(self.ad_hosts));
+            }
+        }
         if !self.account_name.trim().is_empty() {
             o.insert("displayName".into(), json!(self.account_name.trim()));
         }
-        if !self.jmap && !self.graph {
+        if !self.url_only() {
             let out_user = if self.out_separate && !self.out_user.trim().is_empty() {
                 self.out_user.trim()
             } else {
@@ -1175,6 +1216,16 @@ impl Wizard {
             }
             None => {
                 let v = try_run(app, "accounts.add", self.params(None))?;
+                if v.get("needsConfirm").and_then(Value::as_bool) == Some(true) {
+                    // Autodiscover leads outside the domain: nothing was added or sent there.
+                    self.ad_ask = v.get("confirmHost").and_then(Value::as_str).map(str::to_owned);
+                    return Err(v
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Autodiscover leads to a server outside your domain.")
+                        .to_owned());
+                }
+                self.ad_ask = None;
                 let id = v
                     .get("account")
                     .and_then(Value::as_u64)
@@ -1331,39 +1382,57 @@ fn page_type(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
     heading(ui, app, "Advanced setup");
     ui.label(format!("Choose the account type for {}:", st.address.trim()));
     ui.add_space(6.0);
-    let mut pick: Option<(bool, bool, bool)> = None;
+    let mut pick: Option<(bool, bool, bool, bool)> = None;
     ui.horizontal(|ui| {
-        for (jmap, pop3, graph, label, desc) in [
-            (false, false, false, "IMAP", "Reads mail with IMAP and sends it with SMTP (most providers)."),
+        for (jmap, pop3, graph, ews, label, desc) in [
+            (false, false, false, false, "IMAP", "Reads mail with IMAP and sends it with SMTP (most providers)."),
             (
                 false,
                 true,
+                false,
                 false,
                 "POP",
                 "Downloads mail with POP3 and sends it with SMTP; folders stay on this computer.",
             ),
-            (true, false, false, "JMAP", "One JSON-over-HTTPS server for reading and sending (RFC 8620/8621)."),
+            (
+                true,
+                false,
+                false,
+                false,
+                "JMAP",
+                "One JSON-over-HTTPS server for reading and sending (RFC 8620/8621).",
+            ),
             (
                 false,
                 false,
                 true,
+                false,
                 "Microsoft 365",
                 "A Microsoft 365 or Outlook.com mailbox through Microsoft Graph, signed in with your Microsoft \
                  account (OAuth): mail, folders, flags and categories, with sending through the same mailbox.",
+            ),
+            (
+                false,
+                false,
+                false,
+                true,
+                "Exchange",
+                "Exchange Web Services: mail, calendar, contacts, tasks and automatic replies on one server.",
             ),
         ] {
             let r = ui
                 .add_sized([120.0, 60.0], egui::Button::new(RichText::new(label).size(16.0)))
                 .on_hover_text(desc);
             if r.clicked() {
-                pick = Some((jmap, pop3, graph));
+                pick = Some((jmap, pop3, graph, ews));
             }
         }
     });
-    if let Some((jmap, pop3, graph)) = pick {
+    if let Some((jmap, pop3, graph, ews)) = pick {
         st.jmap = jmap;
         st.pop3 = pop3;
         st.graph = graph;
+        st.ews = ews;
         st.guess();
         st.page = PAGE_SETTINGS;
     }
@@ -1426,7 +1495,7 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
                 grid_edit(ui, "Your name:", &mut st.name, "", false);
             });
         }
-        common::heading(ui, app, if st.jmap || st.graph { "Server" } else { "Incoming mail" });
+        common::heading(ui, app, if st.url_only() { "Server" } else { "Incoming mail" });
         if st.graph {
             muted(
                 ui,
@@ -1446,7 +1515,14 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
                 );
                 return;
             }
-            if st.jmap {
+            if st.ews {
+                let hint = if st.change.is_none() {
+                    "Leave empty to find it with Autodiscover"
+                } else {
+                    "https://mail.example.com/EWS/Exchange.asmx"
+                };
+                grid_edit(ui, "EWS address:", &mut st.in_host, hint, false);
+            } else if st.jmap {
                 grid_edit(ui, "Session URL:", &mut st.in_host, "https://example.com/.well-known/jmap", false);
             } else {
                 let hint = if st.pop3 { "pop.example.com" } else { "imap.example.com" };
@@ -1466,7 +1542,7 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
             };
             grid_edit(ui, "Password:", &mut st.password, hint, true);
         });
-        if !st.jmap && !st.graph {
+        if !st.url_only() {
             common::heading(ui, app, "Outgoing mail (SMTP)");
             egui::Grid::new(("mc-wiz-out", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 grid_edit(ui, "Outgoing server:", &mut st.out_host, "smtp.example.com", false);
@@ -1485,7 +1561,7 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
                 });
             }
         }
-        if !st.pop3 && !st.jmap && !st.graph {
+        if !st.pop3 && !st.url_only() {
             offline_settings(ui, app, st);
         }
         more_settings(ui, app, st, uid);
@@ -1503,6 +1579,23 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
     }
     if !st.error.is_empty() {
         ui.colored_label(app.theme.danger, &st.error);
+    }
+    if let Some(host) = st.ad_ask.clone() {
+        // Only on the user's word does the password go to a host outside the domain.
+        if btn(ui, &format!("Sign in at {host}")) {
+            st.ad_ask = None;
+            if !st.ad_hosts.contains(&host) {
+                st.ad_hosts.push(host);
+            }
+            match st.save(app) {
+                Ok(_) => {
+                    st.error.clear();
+                    st.finished = true;
+                    st.page = PAGE_DONE;
+                }
+                Err(e) => st.error = e,
+            }
+        }
     }
     let ok = st.settings_ok();
     let mut out = Out::Keep;
@@ -2021,9 +2114,11 @@ fn test_rows(
     error: &str,
 ) -> Vec<(String, &'static str, String)> {
     let graph = acct.is_some_and(|a| a.kind == AccountKind::Graph);
-    let jmap = graph || acct.is_some_and(|a| a.kind == AccountKind::Jmap);
+    let jmap = graph || acct.is_some_and(|a| matches!(a.kind, AccountKind::Jmap | AccountKind::Exchange));
     let incoming = if graph {
         "Sign in to Microsoft Graph".to_owned()
+    } else if acct.is_some_and(|a| a.kind == AccountKind::Exchange) {
+        "Sign in to the Exchange server".to_owned()
     } else if jmap {
         "Sign in to the JMAP server".to_owned()
     } else {
@@ -2295,6 +2390,47 @@ mod tests {
         assert_eq!(w.in_host, "https://gmail.com/.well-known/jmap");
         assert!(w.provider_notes.is_empty() && w.oauth_hint.is_none() && w.found_in.is_empty());
         assert!(!w.extra.oauth_open && w.extra.provider == 0);
+    }
+
+    #[test]
+    fn an_address_whose_autodiscover_answers_is_set_up_as_exchange() {
+        let mut w = wizard("kim@corp.example.com");
+        w.take_discovery(json!({
+            "found": true, "sources": ["autodiscover"],
+            "ews": {"url": null, "autodiscover": "https://autodiscover.corp.example.com/autodiscover/autodiscover.xml",
+                    "needsSignIn": true, "verified": true},
+        }));
+        w.kind_from_discovery();
+        w.guess();
+        assert!(w.ews && !w.jmap && !w.pop3);
+        assert_eq!(w.kind_name(), "Exchange");
+        assert!(w.in_host.is_empty(), "the EWS address comes from Autodiscover with the password");
+        w.password = "pw".into();
+        assert!(w.settings_ok());
+        let p = w.params(None);
+        assert_eq!(p["kind"], "exchange");
+        assert_eq!(p["autodiscover"], true);
+        assert!(p.get("autodiscoverHosts").is_none(), "no host outside the domain is trusted unasked");
+        assert!(p.get("outgoing").is_none() && p.get("keepOffline").is_none(), "{p}");
+        // A host the user agreed to goes with the request, and not to another address.
+        w.ad_hosts.push("ews.hosting.example.net".into());
+        assert_eq!(w.params(None)["autodiscoverHosts"], json!(["ews.hosting.example.net"]));
+        w.guess();
+        assert!(w.params(None).get("autodiscoverHosts").is_none());
+        // An address given by hand is used as it is.
+        w.in_host = "https://mail.corp.example.com/EWS/Exchange.asmx".into();
+        let p = w.params(None);
+        assert!(p.get("autodiscover").is_none());
+        assert_eq!(p["incoming"]["host"], "https://mail.corp.example.com/EWS/Exchange.asmx");
+        // Found without signing in: the address is filled in.
+        let mut w = wizard("kim@corp.example.com");
+        w.take_discovery(
+            json!({"found": true, "ews": {"url": "https://ews.corp.example.com/EWS/Exchange.asmx",
+                                "needsSignIn": false, "verified": true}}),
+        );
+        w.kind_from_discovery();
+        w.guess();
+        assert_eq!(w.in_host, "https://ews.corp.example.com/EWS/Exchange.asmx");
     }
 
     #[test]

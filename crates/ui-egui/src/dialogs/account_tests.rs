@@ -892,6 +892,8 @@ fn local_lookup(app: &mut App, servers: &mailcraft_testmail::TestServers) {
         http: ConnectOptions::trusting(servers.cert_der.clone()),
         tenant_url: Some(servers.tenant_url_template()),
         allow_reserved: true,
+        autodiscover_urls: Vec::new(),
+        autodiscover_probe: None,
     };
 }
 

@@ -16,6 +16,10 @@ against a real mail server, to find what the local servers do not show. It never
 | `live_pop3_leaves_mail_on_the_server` | POP3 over implicit TLS, leave a copy on the server, no duplicates |
 | `live_jmap_mail_push_and_submission` | a JMAP account: receive, keywords, folders (create, move into, delete), push over the event source, sending with EmailSubmission to itself, quota |
 | `live_carddav_and_caldav` | an IMAP account with a CardDAV / CalDAV server: contacts, a recurring series with an exception, and tasks, created, edited and deleted on both sides |
+| `live_ews_mail` (`live_ews.rs`) | an Exchange (EWS) account: sign-in, folders, receive, read state, flags and categories, moves, a new folder, uploads, delete, sending to itself with the Sent copy |
+| `live_ews_contacts_calendar_tasks` (`live_ews.rs`) | contacts, a recurring series with a changed occurrence, and tasks over EWS, both ways |
+| `live_dav_against_the_same_server` (`live_ews.rs`) | the same mailbox's CardDAV / CalDAV: contacts, a recurring series and a task over DAV, checked through EWS |
+| `mailcraft-net` `live_ews.rs` | the EWS client itself: Autodiscover, sign-in, Out of Office settings, free/busy |
 | `live_jmap_contacts_and_calendars` | a JMAP account with no DAV settings whose server offers JMAP for Contacts and Calendars: contacts and a recurring series with an exception, both ways |
 
 ## Rules the tests keep
@@ -34,6 +38,22 @@ export MC_LIVE_STALWART_HOST=mail.example.com      # IMAPS 993, POP3S 995, SMTPS
 export MC_LIVE_STALWART_USER=test-mailbox@example.com
 export MC_LIVE_STALWART_PASS='…'
 cargo test -p mailcraft-engine --test live_servers -- --ignored --test-threads=1
+```
+
+The Exchange tests (`crates/engine/tests/live_ews.rs`, `crates/net/tests/live_ews.rs`) read their own
+settings. A server with a certificate of its own is trusted through the account's extra root certificate
+(`MC_LIVE_EWS_CA`, a PEM file), never by switching TLS checks off; `MC_LIVE_EWS_ADDR` connects to an address
+other than the one the server name resolves to, for a test server without DNS:
+
+```sh
+export MC_LIVE_EWS_URL=https://mail.example.com/EWS/Exchange.asmx
+export MC_LIVE_EWS_USER=test-mailbox@example.com
+export MC_LIVE_EWS_PASS='…'
+export MC_LIVE_EWS_CA=path/to/server.pem          # optional
+export MC_LIVE_EWS_ADDR=192.0.2.10                # optional
+export MC_LIVE_DAV_URL=https://mail.example.com/dav/   # optional, the DAV test
+cargo test -p mailcraft-engine --test live_ews -- --ignored --test-threads=1
+cargo test -p mailcraft-net --test live_ews -- --ignored --test-threads=1
 ```
 
 Run them one after another (`--test-threads=1`): they share the mailbox, and a push test should not see

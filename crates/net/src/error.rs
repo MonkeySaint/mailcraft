@@ -48,6 +48,10 @@ pub enum NetError {
     /// A Microsoft Graph request failed with an error object (`{"error": {"code", "message"}}`).
     #[error("Microsoft Graph {code} (HTTP {status}): {message}")]
     Graph { status: u16, code: String, message: String },
+    /// An Exchange Web Services operation failed: its response code (`ErrorItemNotFound`, …) and message
+    /// ([MS-OXWSCDATA] ResponseCodeType), or a SOAP fault.
+    #[error("Exchange {code}: {message}")]
+    Ews { code: String, message: String },
     /// The OAuth server returned an error.
     #[error("OAuth {error}: {description}")]
     OAuth { error: String, description: String },

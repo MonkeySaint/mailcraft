@@ -1,8 +1,8 @@
 # Mail accounts
 
-MailCraft talks to mail servers over open protocols: IMAP and POP3 for incoming mail, SMTP for sending, and
-JMAP for both; Microsoft 365 and Outlook.com mailboxes can also be reached through Microsoft Graph's public REST
-API. Exchange (EWS) is not supported. Accounts are added with **File › Add Account** (or
+MailCraft talks to mail servers over open protocols and published APIs: IMAP and POP3 for incoming mail, SMTP
+for sending, and JMAP for both; Microsoft 365 and Outlook.com mailboxes can also be reached through Microsoft
+Graph's public REST API, and Exchange accounts through Exchange Web Services (EWS). Accounts are added with **File › Add Account** (or
 `accounts.add`); try them against the local test servers (`mailcraft-testmail`) rather than a real mailbox.
 
 ## Finding the server settings
@@ -51,6 +51,8 @@ The lookup runs in the background while the wizard says so (**Skip** stops waiti
 says where the settings came from; servers found in DNS outside the address's domain are pointed out and
 should only be used when the provider says so (RFC 6186 section 6). A provider whose document lists only
 OAuth 2.0 opens the OAuth section. Nothing is sent to the servers until you connect or test.
+When nothing else found settings, the lookup asks the domain's Exchange Autodiscover service without
+signing in (see Exchange below); a server that answers makes the account an Exchange account.
 Domains reserved for examples and tests (`example.com/.net/.org`, `.example`, `.test`, `.invalid`,
 `.localhost`) are never looked up.
 
@@ -210,6 +212,65 @@ The local test servers include a fake Graph mail service (`TestServers::graph_ur
 IMAP, POP3 and JMAP servers, with paging, delta links, `$value`, `sendMail`, upload sessions, flag dates, and
 throttling or refused upload sessions on demand; `crates/engine/tests/e2e_graph.rs` runs a Graph account against it end to end, and never against a
 Microsoft service.
+
+## Exchange (EWS)
+
+Exchange accounts use Exchange Web Services (SOAP over HTTPS, written from Microsoft's Open Specifications
+[MS-OXWS…]). They work with Exchange servers that still offer EWS and with other servers that implement it
+(a grommunio server, for example). Microsoft 365 is retiring EWS; use a Microsoft 365 (Graph) account
+there.
+
+- **Setting up.** Choose **Exchange** as the account type (Advanced setup), or let the lookup choose it: when
+  an address has no IMAP, POP or JMAP settings, the lookup asks the domain's Autodiscover service
+  ([MS-OXDSCLI] POX: `https://<domain>/autodiscover/autodiscover.xml`, then
+  `https://autodiscover.<domain>/autodiscover/autodiscover.xml`, then the plain-HTTP redirect of
+  `http://autodiscover.<domain>/autodiscover/autodiscover.xml`, which is only followed to an HTTPS address,
+  then the `_autodiscover._tcp` SRV record). Leave **EWS address** empty and the address is found with the
+  password when the account is added (`accounts.add` with `"autodiscover": true`); or enter the server's EWS
+  address, such as `https://mail.example.com/EWS/Exchange.asmx`. A plain-HTTP EWS address is refused.
+- **Where the password goes during Autodiscover.** Only to hosts in the address's own domain (the domain or a
+  subdomain of it). The plain-HTTP redirect, the SRV record and redirects are not authenticated, so a location
+  they name in another domain is asked without credentials, and an EWS address outside the domain is not
+  used either: the account is not added, and the wizard shows the host with a **Sign in at <host>** button
+  (`accounts.add` answers `{"needsConfirm": true, "confirmHost"}`; add the host to `"autodiscoverHosts"` to
+  agree). Use it only when your provider told you to.
+- **Sign-in.** Basic, NTLM (NTLMv2, [MS-NLMP]; the user name may be `DOMAIN\user`) or an OAuth bearer token.
+  With no method set, MailCraft tries Basic and changes to NTLM when the server offers only NTLM or
+  Negotiate. NTLM signs in one connection, which is kept open for the requests that follow.
+- **A server with its own certificate.** Paste it into the account's extra root certificate setting
+  (`incoming.extraRootPem`). A certificate given there is trusted for that server only, and the server's name
+  is still checked against it; TLS checks are never switched off.
+- **Mail.** Folders come from FindFolder and SyncFolderHierarchy, mail from SyncFolderItems (each folder
+  keeps the server's sync state; the first run takes the download window, newest first) with the message
+  source from GetItem (MimeContent). Read state, flags and categories go back with UpdateItem, moves with
+  MoveItem, deletions with DeleteItem, new folders, renames and folder moves with CreateFolder, UpdateFolder
+  and MoveFolder, drafts and copies with CreateItem. The Outbox is sent with CreateItem (SendAndSaveCopy):
+  the server files the Sent copy. The server's Outbox and non-mail folders are not shown as mail folders.
+- **Contacts, calendar and tasks** synchronise with the mailbox's Contacts, Calendar and Tasks folders over
+  EWS, with the rules for CardDAV / CalDAV below: an edit sends only the fields it changed (UpdateItem with
+  the item's change key, so an edit made elsewhere meanwhile is not overwritten). A recurring series keeps
+  its recurrence, its changed occurrences and its removed ones as they come from the server; a single
+  occurrence changed or removed here is not written back yet (the update is refused with an error, so change
+  the whole series instead). An account whose settings name a DAV server uses that instead.
+- **Meeting requests** received on an Exchange account are answered on the server (AcceptItem,
+  TentativelyAcceptItem, DeclineItem): the server updates its calendar and, unless you chose not to send a
+  response, tells the organizer (an answer not sent leaves no draft behind). The answer is made here first,
+  so a failure here reaches nobody. If the server cannot answer, a reply mail goes as for other accounts.
+- **Automatic Replies** (File › Info, for the Exchange account chosen there; `file.automaticReplies`): on,
+  off or for a time range, one text for your
+  organization and one for others (nobody, your contacts or everyone), read and saved with
+  GetUserOofSettings / SetUserOofSettings.
+- **Other people's free/busy time.** `calendar.freeBusy` with `attendees` asks the server
+  (GetUserAvailability) for their busy times. The Scheduling Assistant shows them in the attendees' rows,
+  asked once per day shown, without waiting on the server in the window.
+- **Large messages and refusals.** New mail is downloaded in batches of at most ten messages and 16 MB; a
+  message too large to download on its own stays on the server and is reported, and a message the server
+  refuses to store (too large, over quota) stays here only and is reported: neither stops sending or
+  receiving. Mail moved into a folder the server does not have stays where it was on the server; a folder is
+  removed there only when it holds no mail and no subfolders.
+- **New mail** is checked every `pollMinutes` (the account shows as **Polling**); EWS push and streaming
+  notifications are not used.
+- Limits today: no header-only mode, no public folders, no delegate access.
 
 ## Download headers only
 

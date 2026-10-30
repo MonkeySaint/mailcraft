@@ -247,6 +247,26 @@ impl HttpResponse {
     }
 }
 
+/// A connection kept open between requests ([`HttpClient::request_kept`]).
+#[derive(Debug, Default)]
+pub struct KeepAlive {
+    conn: Option<(String, Conn)>,
+}
+
+impl KeepAlive {
+    /// True while a connection is open.
+    pub fn is_open(&self) -> bool {
+        self.conn.is_some()
+    }
+
+    /// Closes the connection, if any.
+    pub fn close(&mut self) {
+        if let Some((_, mut c)) = self.conn.take() {
+            c.shutdown();
+        }
+    }
+}
+
 /// Blocking HTTP client.
 #[derive(Clone, Debug)]
 pub struct HttpClient {
@@ -376,15 +396,15 @@ impl HttpClient {
         }
     }
 
-    /// Connects and sends one request; returns the connection with the response unread.
-    fn send(
+    /// The bytes of one request (`Connection: keep-alive` when `keep`, else `close`).
+    fn request_bytes(
         &self,
         method: &str,
         url: &Url,
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
-        deadline: Option<Instant>,
-    ) -> Result<Conn> {
+        keep: bool,
+    ) -> Result<Vec<u8>> {
         if !method.bytes().all(|b| b.is_ascii_uppercase()) || method.is_empty() {
             return Err(NetError::Invalid(format!("HTTP method `{method}`")));
         }
@@ -402,7 +422,7 @@ impl HttpClient {
         if !has("accept") {
             req.push_str("Accept: */*\r\n");
         }
-        req.push_str("Connection: close\r\n");
+        req.push_str(if keep { "Connection: keep-alive\r\n" } else { "Connection: close\r\n" });
         for (k, v) in headers {
             let bad = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
             if bad(k) || bad(v) || k.is_empty() || k.contains(':') {
@@ -420,6 +440,19 @@ impl HttpClient {
         if let Some(b) = body {
             data.extend_from_slice(b);
         }
+        Ok(data)
+    }
+
+    /// Connects and sends one request; returns the connection with the response unread.
+    fn send(
+        &self,
+        method: &str,
+        url: &Url,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        deadline: Option<Instant>,
+    ) -> Result<Conn> {
+        let data = self.request_bytes(method, url, headers, body, false)?;
         let options = match time_left(deadline)? {
             Some(left) => {
                 let mut o = self.options.clone();
@@ -446,6 +479,88 @@ impl HttpClient {
         let resp = self.read_response(&mut conn, method == "HEAD", url, deadline);
         conn.shutdown();
         resp
+    }
+
+    /// Sends one request over `keep`'s open connection to the URL's origin (opening one when there is none,
+    /// or when the server closed it), without following redirects, and leaves the connection open for the
+    /// next request when the server allows. For schemes that sign in a connection rather than a request
+    /// (NTLM, [MS-NLMP]). A reused connection the server had already closed is reopened once.
+    pub fn request_kept(
+        &self,
+        keep: &mut KeepAlive,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse> {
+        let u = Url::parse(url)?;
+        let origin = u.origin().to_ascii_lowercase();
+        let data = self.request_bytes(method, &u, headers, body, true)?;
+        for attempt in 0..2 {
+            let reused = match keep.conn.take() {
+                Some((o, c)) if o == origin => Some(c),
+                Some((_, mut c)) => {
+                    c.shutdown();
+                    None
+                }
+                None => None,
+            };
+            let was_reused = reused.is_some();
+            let mut conn = match reused {
+                Some(c) => c,
+                None => Conn::connect_until(&u.host, u.port, u.https, &self.options, None)?,
+            };
+            if let Err(e) = conn.write_all(&data) {
+                conn.shutdown();
+                if was_reused && attempt == 0 {
+                    continue;
+                }
+                return Err(e);
+            }
+            match self.read_kept(&mut conn, method == "HEAD", &u) {
+                Ok((resp, reusable)) => {
+                    if reusable {
+                        keep.conn = Some((origin, conn));
+                    } else {
+                        conn.shutdown();
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    conn.shutdown();
+                    // The server dropped an idle connection: the request never reached it.
+                    if was_reused && attempt == 0 && e.is_connection_lost() {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(NetError::Closed)
+    }
+
+    /// A response on a kept connection, and whether the connection can carry another request.
+    fn read_kept(&self, conn: &mut Conn, head: bool, url: &Url) -> Result<(HttpResponse, bool)> {
+        let (status, headers) = read_head(conn, None)?;
+        let get = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
+        let close = get("connection").is_some_and(|c| c.to_ascii_lowercase().contains("close"));
+        let mut delimited = true;
+        let body = if head || status == 204 || status == 304 {
+            Vec::new()
+        } else if get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
+            self.read_chunked(conn, None)?
+        } else if let Some(len) = get("content-length") {
+            let n: usize =
+                len.trim().parse().map_err(|_| NetError::Protocol(format!("bad Content-Length `{len}`")))?;
+            if n > self.max_body {
+                return Err(NetError::TooLarge(format!("HTTP body of {n} bytes")));
+            }
+            read_n(conn, n, None)?
+        } else {
+            delimited = false;
+            self.read_until_close(conn, None)?
+        };
+        Ok((HttpResponse { status, headers, body, url: url.to_string() }, delimited && !close))
     }
 
     /// Opens a GET whose body is read as it arrives (`text/event-stream`). No redirects are followed. A

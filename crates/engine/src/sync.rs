@@ -508,7 +508,13 @@ impl SyncState {
 // =======================================================================================================
 
 fn is_server_account(kind: AccountKind) -> bool {
-    matches!(kind, AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph)
+    matches!(kind, AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph | AccountKind::Exchange)
+}
+
+/// Accounts whose local changes are found by comparing with a shadow of the server's state (JMAP,
+/// Microsoft Graph, Exchange) rather than queued as they happen (IMAP).
+pub(crate) fn is_shadow_account(kind: AccountKind) -> bool {
+    matches!(kind, AccountKind::Jmap | AccountKind::Graph | AccountKind::Exchange)
 }
 
 impl Session {
@@ -984,6 +990,24 @@ fn manage_push(s: &mut Session) {
             }
             s.sync.dirty = true;
         }
+        // Exchange: no push connection yet; the Inbox is checked every few minutes instead (Polling).
+        let exchange: Vec<AccountId> = s
+            .mailbox
+            .accounts
+            .iter()
+            .filter(|a| a.kind == AccountKind::Exchange && a.incoming.is_some())
+            .map(|a| a.id)
+            .collect();
+        for id in exchange {
+            let opts = crate::accounts::account_options(s, id);
+            let Some(run) = s.sync.runs.get_mut(&id) else { continue };
+            let want = !s.view.work_offline && opts.push && run.last_sync.is_some() && run.error.is_none();
+            let mode = if want { PushMode::Polling } else { PushMode::Off };
+            if run.push != mode {
+                run.push = mode;
+                s.sync.dirty = true;
+            }
+        }
         let ids: Vec<AccountId> = s
             .mailbox
             .accounts
@@ -1328,6 +1352,13 @@ pub(crate) fn queue_local_changes(s: &mut Session, changes: &mut crate::changes:
             s.mailbox.accounts.iter().filter(|a| a.kind == AccountKind::Graph).map(|a| a.id).collect();
         for a in graph {
             if graph::changed(&changes.small, mail, &s.mailbox, a) {
+                s.sync.jmap_dirty.insert(a);
+            }
+        }
+        let exchange: Vec<AccountId> =
+            s.mailbox.accounts.iter().filter(|a| a.kind == AccountKind::Exchange).map(|a| a.id).collect();
+        for a in exchange {
+            if ews::changed(&changes.small, mail, &s.mailbox, a) {
                 s.sync.jmap_dirty.insert(a);
             }
         }
@@ -1766,11 +1797,9 @@ pub(crate) fn after_restore(s: &mut Session, changes: &mut crate::changes::Chang
     pim::carry_over(live, &mut s.mailbox, &s.sync.track.pim_created, &s.sync.track.pim_removed);
     // IMAP and JMAP accounts alike: without this, a JMAP folder or message the server added meanwhile would
     // be missing from the restored mailbox and the next run would remove it from the server.
-    if !live
-        .accounts
-        .iter()
-        .any(|a| matches!(a.kind, AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph))
-    {
+    if !live.accounts.iter().any(|a| {
+        matches!(a.kind, AccountKind::Imap | AccountKind::Jmap | AccountKind::Graph | AccountKind::Exchange)
+    }) {
         return;
     }
     let Some(live_mail) = changes.mail.as_ref() else { return };
@@ -1856,9 +1885,7 @@ fn carry_over(live: &Mailbox, live_mail: &MailChanges, restored: &mut Mailbox, t
     // JMAP email ids and Graph message ids (immutable ids) stay the same when a message moves between folders
     // of its account (IMAP UIDs do not).
     let jmap_account = |mb: &Mailbox, f: FolderId| {
-        mb.folder(f).map(|f| f.account).filter(|a| {
-            mb.account(*a).is_some_and(|a| matches!(a.kind, AccountKind::Jmap | AccountKind::Graph))
-        })
+        mb.folder(f).map(|f| f.account).filter(|a| mb.account(*a).is_some_and(|a| is_shadow_account(a.kind)))
     };
     let put_back: Vec<(ItemId, FolderId, Option<String>, bool, FlagState)> = live_mail
         .iter()
@@ -2017,6 +2044,12 @@ pub mod arrival;
 pub mod cmds;
 #[cfg(not(target_arch = "wasm32"))]
 mod dav;
+#[cfg(not(target_arch = "wasm32"))]
+mod ews;
+#[cfg(not(target_arch = "wasm32"))]
+mod ews_extra;
+#[cfg(not(target_arch = "wasm32"))]
+mod ews_pim;
 pub mod focus;
 #[cfg(not(target_arch = "wasm32"))]
 mod graph;
@@ -2080,6 +2113,285 @@ pub(crate) fn cancel_oauth(s: &mut Session, id: AccountId) -> bool {
 }
 
 // =======================================================================================================
+// Exchange services: automatic replies, other people's free/busy time, meeting answers
+// =======================================================================================================
+
+/// Longest automatic reply accepted.
+const MAX_REPLY_CHARS: usize = 64 * 1024;
+
+/// `file.automaticReplies`: reads the Exchange account's automatic replies (and asks the UI to show them),
+/// or changes them when the params name a change.
+pub(crate) fn automatic_replies(s: &mut Session, p: &Value) -> Result<Value, CmdError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let wanted = match p.get("account") {
+            Some(v) if !v.is_null() => Some(crate::accounts::find_account(s, p, "account")?),
+            _ => None,
+        };
+        let Some(account) = ews_extra::exchange_account(s, wanted) else {
+            return Err(CmdError::Disabled("Automatic replies need an Exchange account".into()));
+        };
+        let text = |k: &str| -> Result<Option<String>, CmdError> {
+            match p.get(k) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(t)) if t.chars().count() <= MAX_REPLY_CHARS && !t.contains('\0') => {
+                    Ok(Some(t.clone()))
+                }
+                Some(_) => Err(CmdError::Params(format!(
+                    "`{k}` must be a text of at most {MAX_REPLY_CHARS} characters"
+                ))),
+            }
+        };
+        let state = match p.get("state").and_then(Value::as_str) {
+            None => None,
+            Some("off") => Some("Disabled"),
+            Some("on") => Some("Enabled"),
+            Some("scheduled") => Some("Scheduled"),
+            Some(other) => {
+                return Err(CmdError::Params(format!("`state` must be off, on or scheduled, not `{other}`")));
+            }
+        };
+        let outside = match p.get("outside").and_then(Value::as_str) {
+            None => None,
+            Some("none") => Some("None"),
+            Some("contacts") => Some("Known"),
+            Some("everyone") => Some("All"),
+            Some(other) => {
+                return Err(CmdError::Params(format!(
+                    "`outside` must be none, contacts or everyone, not `{other}`"
+                )));
+            }
+        };
+        let offset = i64::from(s.tz_offset_min);
+        let time = |k: &str| -> Result<Option<String>, CmdError> {
+            let Some(v) = p.get(k).and_then(Value::as_str) else { return Ok(None) };
+            let has_zone =
+                v.trim().ends_with('Z') || v.trim().get(16..).is_some_and(|t| t.contains(['+', '-']));
+            let d = mailcraft_model::DateTime::parse_rfc5322(v.trim())
+                .map_err(|_| CmdError::Params(format!("`{k}` must be a date and time (YYYY-MM-DDTHH:MM)")))?;
+            let unix = if has_zone { d.unix } else { d.unix.saturating_sub(offset.saturating_mul(60)) };
+            Ok(Some(mailcraft_model::DateTime::from_unix(unix, 0).to_rfc3339()))
+        };
+        let (inside, outside_text, start, end) =
+            (text("insideReply")?, text("outsideReply")?, time("start")?, time("end")?);
+        let changing = state.is_some()
+            || outside.is_some()
+            || inside.is_some()
+            || outside_text.is_some()
+            || start.is_some()
+            || end.is_some();
+        let mut o = ews_extra::oof(s, account).map_err(CmdError::Failed)?;
+        if changing {
+            if let Some(st) = state {
+                o.state = st.into();
+            }
+            if let Some(x) = outside {
+                o.external_audience = x.into();
+            }
+            if let Some(t) = inside {
+                o.internal_reply = t;
+            }
+            if let Some(t) = outside_text {
+                o.external_reply = t;
+            }
+            if start.is_some() {
+                o.start = start;
+            }
+            if end.is_some() {
+                o.end = end;
+            }
+            if o.state == "Scheduled" {
+                let (Some(a), Some(b)) = (
+                    o.start.as_deref().and_then(ews::parse_time),
+                    o.end.as_deref().and_then(ews::parse_time),
+                ) else {
+                    return Err(CmdError::Params(
+                        "scheduled automatic replies need `start` and `end`".into(),
+                    ));
+                };
+                if b <= a {
+                    return Err(CmdError::Params("`end` must follow `start`".into()));
+                }
+            }
+            ews_extra::set_oof(s, account, &o).map_err(CmdError::Failed)?;
+        }
+        let state_name = match o.state.as_str() {
+            "Enabled" => "on",
+            "Scheduled" => "scheduled",
+            _ => "off",
+        };
+        let outside_name = match o.external_audience.as_str() {
+            "Known" => "contacts",
+            "All" => "everyone",
+            _ => "none",
+        };
+        // Times as local "YYYY-MM-DDTHH:MM", like the params.
+        let local = |t: &Option<String>| {
+            let unix = ews::parse_time(t.as_deref()?)?.saturating_add(offset.saturating_mul(60));
+            mailcraft_model::DateTime::from_unix(unix, 0).to_rfc3339().get(..16).map(str::to_owned)
+        };
+        let mut v = json!({
+            "account": account.0,
+            "state": state_name,
+            "start": local(&o.start),
+            "end": local(&o.end),
+            "insideReply": o.internal_reply,
+            "outsideReply": o.external_reply,
+            "outside": outside_name,
+            "saved": changing,
+        });
+        if !changing && p.get("dialog").and_then(Value::as_bool) != Some(false) {
+            s.notify(crate::Notice::OpenDialog("automaticReplies".into(), v.clone()));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("dialog".into(), json!("automaticReplies"));
+            }
+        }
+        Ok(v)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, p);
+        Err(CmdError::Disabled("Automatic replies need the desktop app".into()))
+    }
+}
+
+/// Other people's busy times from the Exchange server of the current account, for the Scheduling Assistant:
+/// one entry per address, `{address, busy: [{start, end, showAs}]}` or `{address, error}`. `None` when the
+/// account is not an Exchange account.
+pub(crate) fn attendee_availability(s: &Session, addresses: &[String], from: i64, to: i64) -> Option<Value> {
+    availability_lookup(s, addresses, from, to).map(AvailabilityLookup::run)
+}
+
+/// A lookup of other people's busy times (see `calendar.freeBusy` with `attendees`), prepared on the
+/// session's thread and run on any other: the Scheduling Assistant runs it off the UI thread, as it waits on
+/// the server.
+#[derive(Clone, Debug)]
+pub struct AvailabilityLookup {
+    #[cfg(not(target_arch = "wasm32"))]
+    conn: Result<ews::EwsConn, String>,
+    addresses: Vec<String>,
+    from: i64,
+    to: i64,
+}
+
+/// Prepares the lookup of `addresses`' busy times between `from` and `to` (Unix seconds) on the Exchange
+/// server of the current account (else the first Exchange account). `None` without an Exchange account.
+pub fn availability_lookup(
+    s: &Session,
+    addresses: &[String],
+    from: i64,
+    to: i64,
+) -> Option<AvailabilityLookup> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let account = ews_extra::exchange_account(s, None)?;
+        Some(AvailabilityLookup {
+            conn: ews_extra::conn(s, account),
+            addresses: addresses.iter().take(100).cloned().collect(),
+            from,
+            to,
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, addresses, from, to);
+        None
+    }
+}
+
+impl AvailabilityLookup {
+    /// The addresses asked about.
+    pub fn addresses(&self) -> &[String] {
+        &self.addresses
+    }
+
+    /// Asks the server (blocking): one entry per address, `{address, busy: [{start, end, showAs}]}` or
+    /// `{address, error}`.
+    pub fn run(self) -> Value {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.run_ews()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            json!(
+                self.addresses
+                    .iter()
+                    .map(|a| json!({"address": a, "error": "not available"}))
+                    .collect::<Vec<_>>()
+            )
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn run_ews(self) -> Value {
+        let (from, to) = (self.from, self.to);
+        let list = self.addresses;
+        let fmt = |t: i64| {
+            let d = mailcraft_model::DateTime::from_unix(t, 0).to_rfc3339();
+            d.trim_end_matches('Z').to_owned()
+        };
+        let r = match self.conn.and_then(|c| ews_extra::availability(&c, &list, &fmt(from), &fmt(to))) {
+            Ok(r) => r,
+            Err(e) => {
+                return json!(list.iter().map(|a| json!({"address": a, "error": e})).collect::<Vec<_>>());
+            }
+        };
+        let show = |b: &str| match b {
+            "Tentative" => "tentative",
+            "OOF" => "outOfOffice",
+            "WorkingElsewhere" => "workingElsewhere",
+            "Free" => "free",
+            "NoData" => "unknown",
+            _ => "busy",
+        };
+        let out: Vec<Value> = list
+            .iter()
+            .zip(r)
+            .map(|(a, res)| match res {
+                Ok(blocks) => json!({"address": a, "busy": blocks.iter().filter_map(|b| {
+                    Some(json!({"start": ews::parse_time(&b.start)?, "end": ews::parse_time(&b.end)?, "showAs": show(&b.busy_type)}))
+                }).collect::<Vec<_>>()}),
+                Err(e) => json!({"address": a, "error": e}),
+            })
+            .collect();
+        json!(out)
+    }
+}
+
+/// Answers a meeting request kept on an Exchange server through the server itself (which updates its
+/// calendar and, with `send`, tells the organizer). `Ok(false)` when the message is not one of those.
+pub(crate) fn exchange_meeting_reply(
+    s: &Session,
+    mail: ItemId,
+    response: &str,
+    send: bool,
+    comment: &str,
+) -> Result<bool, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Some(m) = s.mailbox.mail.get(mail) else { return Ok(false) };
+        let Some(remote) = m.remote_id.clone() else { return Ok(false) };
+        let Some(account) = s.mailbox.folder(m.folder).map(|f| f.account) else { return Ok(false) };
+        if ews_extra::exchange_account(s, Some(account)).is_none() {
+            return Ok(false);
+        }
+        let reply = match response {
+            "accepted" => mailcraft_net::ews::MeetingReply::Accept,
+            "tentative" => mailcraft_net::ews::MeetingReply::Tentative,
+            "declined" => mailcraft_net::ews::MeetingReply::Decline,
+            _ => return Ok(false),
+        };
+        ews_extra::reply_to_meeting(s, account, &remote, reply, send, comment).map(|()| true)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, mail, response, send, comment);
+        Ok(false)
+    }
+}
+
+// =======================================================================================================
 // Server settings lookup (accounts.discover)
 // =======================================================================================================
 
@@ -2122,6 +2434,9 @@ fn discovery_json(d: &mailcraft_net::discover::Discovery) -> Value {
         "pop3": server(&d.pop3),
         "smtp": server(&d.smtp),
         "jmap": d.jmap.as_ref().map(|j| json!({"url": j.host, "verified": j.verified})),
+        // An Exchange server found by Autodiscover: its EWS URL, or that it wants the password first.
+        "ews": d.ews.as_ref().map(|e| json!({"url": e.url, "autodiscover": e.autodiscover,
+            "needsSignIn": e.needs_sign_in, "verified": e.verified})),
         // A well-known provider (Microsoft 365, Outlook.com, Google): its OAuth provider, hints for the
         // settings page, and whether a Microsoft Graph account kind could serve it (graph-mail, issue #4).
         "provider": d.provider.map(|m| json!({

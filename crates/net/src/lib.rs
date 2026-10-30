@@ -15,6 +15,7 @@ pub mod discover;
 pub mod dns;
 pub mod error;
 pub mod eventsource;
+pub mod ews;
 pub mod graph;
 pub mod http;
 pub mod image_fetch;

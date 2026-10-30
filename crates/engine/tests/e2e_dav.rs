@@ -1413,3 +1413,68 @@ fn edits_keep_what_the_server_copy_holds_beyond_the_mapping() {
     update_folder(&mut s, cal);
     assert_eq!(puts(), before);
 }
+
+/// Regression: a server that stores a new resource under a name of its own (seen on a grommunio server)
+/// left the uploaded item linked to a name the server does not list: the next run took it as gone there and
+/// downloaded it again, and deleting it here never reached the server.
+#[test]
+fn a_server_that_renames_new_resources_keeps_one_copy_and_deletes_it() {
+    let srv = servers();
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "tasks": false, "calendar": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    srv.set_dav_rename_new(true);
+    let id = ItemId(s.mailbox.alloc_id());
+    s.mailbox.contacts.insert(
+        id,
+        Contact {
+            id,
+            folder: contacts,
+            first_name: "Quinn".into(),
+            last_name: "Renamed".into(),
+            ..Default::default()
+        },
+    );
+    update_folder(&mut s, contacts);
+    let items = srv.dav_items(ALICE, "contacts");
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(items[0].0.starts_with("srv-"), "the server picked the name: {items:?}");
+    // The next run finds it under the server's name: one copy here, linked there.
+    update_folder(&mut s, contacts);
+    update_folder(&mut s, contacts);
+    assert_eq!(s.mailbox.contacts.values().filter(|c| c.folder == contacts).count(), 1);
+    let link = s.mailbox.contacts[&id].remote.clone().expect("still linked");
+    assert!(link.url.ends_with(&items[0].0), "{} vs {}", link.url, items[0].0);
+    // Deleted here: deleted there.
+    s.mailbox.contacts.remove(&id);
+    update_folder(&mut s, contacts);
+    assert!(srv.dav_items(ALICE, "contacts").is_empty(), "{:?}", srv.dav_items(ALICE, "contacts"));
+    assert!(s.mailbox.contacts.values().all(|c| c.folder != contacts));
+}
+
+/// Regression: on a server whose ETags are a version counter (the same for every new resource), a contact
+/// deleted on another device while another one was created there shares its ETag with the new one. The
+/// rename check linked the deleted contact to the new resource: the new contact never arrived, the deleted one
+/// stayed, and its next edit would have overwritten the new one on the server.
+#[test]
+fn a_shared_etag_never_links_a_deleted_contact_to_another_resource() {
+    const XC: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:x-1\r\nFN:Xan Old\r\nN:Old;Xan;;;\r\nEND:VCARD\r\n";
+    const YC: &str = "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:y-1\r\nFN:Yu New\r\nN:New;Yu;;;\r\nEND:VCARD\r\n";
+    let srv = servers();
+    srv.set_dav_constant_etag(Some("\"v00000000\""));
+    let mut s = session();
+    let alice = add_alice(&mut s, &srv, json!({"url": srv.dav_url(), "tasks": false, "calendar": false}));
+    let contacts = role(&s, alice, FolderRole::Contacts);
+    srv.put_dav_item(ALICE, "contacts", "x-1.vcf", XC).unwrap();
+    update_folder(&mut s, contacts);
+    assert!(contact_named(&s, contacts, "Xan").is_some_and(|c| c.remote.is_some()), "linked");
+    // On a phone: X deleted, Y created (with the same ETag).
+    assert!(srv.delete_dav_item(ALICE, "contacts", "x-1.vcf"));
+    srv.put_dav_item(ALICE, "contacts", "y-1.vcf", YC).unwrap();
+    update_folder(&mut s, contacts);
+    assert!(contact_named(&s, contacts, "Xan").is_none(), "deleted there: deleted here");
+    let yu = contact_named(&s, contacts, "Yu").expect("the new contact arrives");
+    assert!(yu.remote.as_ref().is_some_and(|r| r.url.ends_with("y-1.vcf")));
+    assert_eq!(srv.dav_items(ALICE, "contacts").len(), 1);
+    assert!(srv.dav_items(ALICE, "contacts")[0].1.contains("Yu New"), "the new contact is untouched");
+}

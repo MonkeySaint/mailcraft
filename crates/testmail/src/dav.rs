@@ -75,6 +75,12 @@ pub struct DavState {
     /// Users get one calendar for events and tasks (`calendar`, VEVENT and VTODO) and no `tasks` collection,
     /// as servers that give each user one default calendar.
     pub single_calendar: bool,
+    /// A new resource is stored under a name the server picks (`srv-<n>.<ext>`), not the one PUT named, as
+    /// some servers do (the client learns the name from the next listing).
+    pub rename_new: bool,
+    /// Every resource written gets this ETag (a version counter that starts the same for each new
+    /// resource, as some servers send): ETags are then unique per resource only, not across a collection.
+    pub constant_etag: Option<String>,
 }
 
 pub type SharedDav = Arc<Mutex<DavState>>;
@@ -139,7 +145,10 @@ impl DavState {
 
     pub fn new_etag(&mut self) -> String {
         self.next_etag = self.next_etag.saturating_add(1);
-        format!("\"{}\"", self.next_etag)
+        match &self.constant_etag {
+            Some(e) => e.clone(),
+            None => format!("\"{}\"", self.next_etag),
+        }
     }
 
     /// Stores a resource; returns its new ETag.
@@ -475,7 +484,13 @@ pub fn handle(conn: &mut Conn, ctx: &Ctx, req: &Request) -> io::Result<()> {
                 return plain(conn, "507 Insufficient Storage", "full");
             }
             let ctype = req.header("content-type").unwrap_or("application/octet-stream").to_owned();
-            let etag = d.put(&me, &coll, &item, req.body.clone(), &ctype).unwrap_or_default();
+            let name = if current.is_none() && d.rename_new {
+                let ext = item.rsplit_once('.').map(|(_, e)| e.to_owned()).unwrap_or_default();
+                format!("srv-{}.{ext}", d.next_etag)
+            } else {
+                item.clone()
+            };
+            let etag = d.put(&me, &coll, &name, req.body.clone(), &ctype).unwrap_or_default();
             if let Some((u, c, n, data)) = d.after_next_put.take() {
                 let ctype = if c == "contacts" { "text/vcard" } else { "text/calendar" };
                 d.put(&u, &c, &n, data.into_bytes(), ctype);
