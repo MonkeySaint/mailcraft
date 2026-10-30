@@ -608,7 +608,10 @@ struct Extra {
     /// [`OfflineWindow::ALL`]).
     keep_offline: bool,
     offline_window: usize,
+    /// The Sign in with OAuth 2.0 section is open (the password may then stay empty).
     oauth_open: bool,
+    /// The wizard opens (or closes) the OAuth section once, on the next frame; after that it is the user's.
+    oauth_set: Option<bool>,
     /// OAuth providers: (id, name, offers the device flow, mail domains it serves).
     providers: Vec<(String, String, bool, Vec<String>)>,
     provider: usize,
@@ -657,6 +660,7 @@ impl Extra {
             keep_offline: o.keep_offline,
             offline_window: o.offline_window.index(),
             oauth_open: false,
+            oauth_set: None,
             providers: Vec::new(),
             provider: 0,
             client_id: o.oauth.as_ref().map(|b| b.client_id.clone()).unwrap_or_default(),
@@ -836,7 +840,7 @@ impl Wizard {
         if self.graph {
             mailcraft_engine::accounts::GRAPH_BASE.clone_into(&mut self.in_host);
             // Graph takes no password: the sign-in is the OAuth section's.
-            self.extra.oauth_open = true;
+            self.open_oauth();
         } else if self.ews {
             // Empty: Autodiscover finds the EWS address when the account is added.
             self.in_host.clear();
@@ -902,7 +906,7 @@ impl Wizard {
             // The well-known providers sign in with OAuth (Microsoft only so): the section opens with the
             // provider chosen, once per lookup. Google app-password users close it again, and it stays closed.
             if preselect {
-                self.extra.oauth_open = true;
+                self.open_oauth();
                 self.pick_oauth_provider();
             }
         }
@@ -955,7 +959,7 @@ impl Wizard {
                 note(out, host);
             }
             if preselect && inc.get("oauthOnly").and_then(Value::as_bool) == Some(true) {
-                self.extra.oauth_open = true;
+                self.open_oauth();
             }
         }
         let by = provider.and_then(|p| p.get("detectedBy")).and_then(Value::as_str).unwrap_or_default();
@@ -985,6 +989,39 @@ impl Wizard {
             }
             _ => "These settings come from your domain's DNS records.".into(),
         };
+    }
+
+    /// Opens the OAuth section (once: the user can close it again).
+    fn open_oauth(&mut self) {
+        self.extra.oauth_open = true;
+        self.extra.oauth_set = Some(true);
+    }
+
+    /// Starts a new account ("(Not you?)", or another address after this wizard added an account): the
+    /// account already added stays as it is, and nothing tied to it carries over to the next one: its id (so
+    /// saving adds a new account instead of changing that one), its sign-in state, passwords, lookup results,
+    /// options and server settings. The name, the address and the manual setup choice stay.
+    fn start_new_account(&mut self) {
+        let providers = std::mem::take(&mut self.extra.providers);
+        *self = Wizard {
+            page: self.page,
+            manual: self.manual,
+            name: std::mem::take(&mut self.name),
+            address: std::mem::take(&mut self.address),
+            // The section closes again; a lookup for the new address may open it.
+            extra: Extra { providers, oauth_set: Some(false), ..Extra::default() },
+            ..Wizard::default()
+        };
+    }
+
+    /// Before a lookup for the address on the first page: a changed address after this wizard added an
+    /// account starts a new account (else saving would change the one already added).
+    fn address_changed(&mut self, app: &App) {
+        let Some(id) = self.created else { return };
+        let same = account_of(app, id).is_some_and(|a| a.address.eq_ignore_ascii_case(self.address.trim()));
+        if !same {
+            self.start_new_account();
+        }
     }
 
     /// Chooses the OAuth provider for the address: the well-known provider's, else the one serving its
@@ -1120,6 +1157,46 @@ impl Wizard {
                 || self.extra.oauth_open)
     }
 
+    /// Why Sign In (OAuth) is greyed out: what is still to be entered (`None`: nothing, it can be clicked).
+    fn sign_in_missing(&self) -> Option<String> {
+        let mut missing = Vec::new();
+        if !self.address_ok() {
+            missing.push("a valid email address");
+        }
+        if self.extra.client_id.trim().is_empty() {
+            missing.push("the client id of your app registration");
+        }
+        let no_server = self.in_host.trim().is_empty();
+        if no_server {
+            missing.push(if self.ews {
+                "the EWS address"
+            } else if self.graph {
+                "the Graph endpoint"
+            } else if self.jmap {
+                "the session URL"
+            } else {
+                "the server address"
+            });
+        }
+        let (last, rest) = missing.split_last()?;
+        let list =
+            if rest.is_empty() { (*last).to_owned() } else { format!("{} and {last}", rest.join(", ")) };
+        let mut text = format!("To sign in, enter {list}.");
+        if self.ews && no_server {
+            // Autodiscover needs the password, which an OAuth sign-in does not have.
+            text.push_str(
+                " Autodiscover cannot find the EWS address without a password, so enter it to sign in with \
+                 OAuth. Microsoft 365 and Exchange Online mailboxes use the Microsoft 365 account type instead",
+            );
+            text.push_str(if self.change.is_none() {
+                " (< Back, then Let me set up my account manually)."
+            } else {
+                "."
+            });
+        }
+        Some(text)
+    }
+
     /// The More Settings options as command params.
     fn option_params(&self, o: &mut serde_json::Map<String, Value>) {
         let e = &self.extra;
@@ -1148,12 +1225,27 @@ impl Wizard {
         }
     }
 
+    /// The account type as the commands name it.
+    fn kind(&self) -> &'static str {
+        if self.graph {
+            "graph"
+        } else if self.ews {
+            "exchange"
+        } else if self.jmap {
+            "jmap"
+        } else if self.pop3 {
+            "pop3"
+        } else {
+            "imap"
+        }
+    }
+
     /// Params for `accounts.add` (no `account`) or `accounts.edit` (with it). Empty passwords are left out
     /// (Change keeps the saved one).
     fn params(&self, account: Option<u32>) -> Value {
         let user = if self.in_user.trim().is_empty() { self.address.trim() } else { self.in_user.trim() };
         let mut p = json!({
-            "kind": if self.graph { "graph" } else if self.ews { "exchange" } else if self.jmap { "jmap" } else if self.pop3 { "pop3" } else { "imap" },
+            "kind": self.kind(),
             "address": self.address.trim(),
             "senderName": self.name.trim(),
             "incoming": {
@@ -1209,6 +1301,16 @@ impl Wizard {
 
     /// Adds the account (first time) or updates the one this wizard made or changes. Returns its id.
     fn save(&mut self, app: &mut App) -> Result<u32, String> {
+        if self.change.is_none()
+            && let Some(id) = self.created
+            && account_of(app, id)
+                .is_some_and(|a| mailcraft_engine::accounts::kind_label(&app.s, &a) != self.kind())
+        {
+            // Another account type for the same address (< Back): the type of an account cannot be changed, so
+            // the one this wizard added for the old type goes and a new one is added.
+            try_run(app, "accounts.remove", json!({"account": id, "confirm": true}))?;
+            self.created = None;
+        }
         match self.change.or(self.created) {
             Some(id) => {
                 try_run(app, "accounts.edit", self.params(Some(id)))?;
@@ -1316,6 +1418,7 @@ fn page_email(ui: &mut Ui, app: &mut App, st: &mut Wizard) -> Out {
             return Out::Close;
         }
         if primary(ui, app, ok, "Connect") || (ok && enter) {
+            st.address_changed(app);
             st.error.clear();
             st.discovered = None;
             match try_run(app, "accounts.discover", json!({"address": st.address.trim(), "refresh": true})) {
@@ -1463,6 +1566,7 @@ fn page_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Out {
     ui.horizontal(|ui| {
         ui.label(RichText::new(st.address.trim()).strong());
         if st.change.is_none() && ui.link("(Not you?)").clicked() {
+            st.start_new_account();
             st.page = PAGE_EMAIL;
         }
     });
@@ -1715,46 +1819,37 @@ fn more_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
 fn pim_server_settings(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) {
     egui::CollapsingHeader::new("Contacts, Tasks and Calendar Server").id_salt(("mc-wiz-dav", uid)).show(ui, |ui| {
         let e = &mut st.extra;
-        egui::Grid::new(("mc-wiz-dav-grid", uid)).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        // Fields as wide as the other grids; the check boxes stacked and the longer texts below the grid, where
+        // they wrap, so the section fits the window's width.
+        egui::Grid::new(("mc-wiz-dav-grid", uid)).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
             grid_edit(ui, "Server address:", &mut e.dav_url, "https://dav.example.com/", false);
-            ui.end_row();
             ui.label("");
-            ui.horizontal(|ui| {
+            ui.vertical(|ui| {
                 ui.checkbox(&mut e.dav_contacts, "Keep Contacts on the server");
                 ui.checkbox(&mut e.dav_tasks, "Keep Tasks on the server");
                 ui.checkbox(&mut e.dav_calendar, "Keep Calendar on the server");
             });
             ui.end_row();
             grid_edit(ui, "Publish calendars to:", &mut e.dav_publish, "https://dav.example.com/public/", false);
-            ui.end_row();
             grid_edit(ui, "User name (if different):", &mut e.dav_user, "", false);
-            ui.end_row();
             grid_edit(ui, "Password (if different):", &mut e.dav_password, "", true);
-            ui.end_row();
-            if e.dav_has_password {
-                ui.label("");
-                ui.vertical(|ui| {
-                    let saved = if e.dav_forget_password {
-                        "The saved password for this server is removed when you save."
-                    } else {
-                        "This server has a saved password of its own (leave the field empty to keep it)."
-                    };
-                    ui.label(RichText::new(saved).color(app.theme.text_muted));
-                    ui.checkbox(&mut e.dav_forget_password, "Use the account's password instead");
-                });
-                ui.end_row();
-            }
-            ui.label("");
-            ui.checkbox(&mut e.dav_plain, "Allow signing in over http:// (a server on this computer or network)");
-            ui.end_row();
         });
-        ui.label(
-            RichText::new(
-                "Without a password of its own the server gets the account's password. A sign-in through the \
-                 mail provider's page only works for the provider's own server. Send/Receive updates contacts, \
-                 tasks, calendars and published calendars.",
-            )
-            .color(app.theme.text_muted),
+        if e.dav_has_password {
+            let saved = if e.dav_forget_password {
+                "The saved password for this server is removed when you save."
+            } else {
+                "This server has a saved password of its own (leave the field empty to keep it)."
+            };
+            muted(ui, app, saved);
+            ui.checkbox(&mut e.dav_forget_password, "Use the account's password instead");
+        }
+        ui.checkbox(&mut e.dav_plain, "Allow signing in over http:// (a server on this computer or network)");
+        muted(
+            ui,
+            app,
+            "Without a password of its own the server gets the account's password. A sign-in through the mail \
+             provider's page only works for the provider's own server. Send/Receive updates contacts, tasks, \
+             calendars and published calendars.",
         );
     });
     let Some(id) = st.change.or(st.created) else { return };
@@ -1800,7 +1895,7 @@ fn oauth_section(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Optio
     let mut open_url = None;
     let r = egui::CollapsingHeader::new("Sign in with OAuth 2.0 instead of a password")
         .id_salt(("mc-wiz-oauth", uid))
-        .open(if st.extra.oauth_open { Some(true) } else { None })
+        .open(st.extra.oauth_set.take())
         .show(ui, |ui| {
             if st.extra.providers.is_empty() {
                 let list = try_run(app, "accounts.oauthProviders", json!({})).unwrap_or_default();
@@ -1858,8 +1953,9 @@ fn oauth_section(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Optio
             if running {
                 ctx_repaint(ui);
             }
+            let missing = st.sign_in_missing();
             ui.horizontal(|ui| {
-                let ready = st.address_ok() && !st.extra.client_id.trim().is_empty() && !st.in_host.trim().is_empty();
+                let ready = missing.is_none();
                 if ui.add_enabled(ready && !running, egui::Button::new("Sign In")).clicked() {
                     match st.save(app) {
                         Ok(id) => {
@@ -1899,6 +1995,10 @@ fn oauth_section(ui: &mut Ui, app: &mut App, st: &mut Wizard, uid: u64) -> Optio
                     let _ = try_run(app, "accounts.oauthCancel", json!({"account": i}));
                 }
             });
+            // A greyed-out Sign In says why.
+            if !running && let Some(m) = &missing {
+                muted(ui, app, m);
+            }
             if let Some(f) = &flow {
                 match f.status.as_str() {
                     "waiting" | "starting" => {
@@ -2531,6 +2631,77 @@ mod tests {
         assert_eq!(p["kind"], "exchange");
         assert_eq!(p["incoming"]["host"], "https://ews.both.example.com/EWS/Exchange.asmx");
         assert!(p.get("outgoing").is_none(), "{p}");
+    }
+
+    #[test]
+    fn a_new_account_forgets_the_one_already_added() {
+        // Regression (#30): "(Not you?)" kept the added account's id, so the next address changed it.
+        let mut w = wizard("kim@m365.example.com");
+        w.graph = true;
+        w.guess();
+        w.created = Some(7);
+        w.password = "pw".into();
+        w.extra.client_id = "app".into();
+        w.extra.oauth_error = "Sign-in failed.".into();
+        w.extra.dav_password = "dav-pw".into();
+        w.tenant = Some("6f1a5c2e-0b7d-4c3a-9e8f-1d2c3b4a5e6f".into());
+        w.discovered = Some(json!({"found": true}));
+        w.manual = true;
+        w.start_new_account();
+        assert!(w.created.is_none() && !w.graph && w.in_host.is_empty());
+        assert!(w.password.is_empty() && w.extra.dav_password.is_empty() && w.extra.client_id.is_empty());
+        assert!(w.extra.oauth_error.is_empty() && w.tenant.is_none() && w.discovered.is_none());
+        assert_eq!(w.extra.oauth_set, Some(false), "the OAuth section closes");
+        assert!(!w.extra.oauth_open);
+        assert_eq!(w.address, "kim@m365.example.com");
+        assert!(w.manual && w.extra.providers.len() == 2, "the address page's choices stay");
+        let p = w.params(None);
+        assert!(p.get("account").is_none(), "added, not edited: {p}");
+    }
+
+    #[test]
+    fn the_wizard_opens_the_oauth_section_once() {
+        // Regression (#31): the section was forced open every frame; the wizard asks once.
+        let mut w = wizard("kim@m365.example.com");
+        w.graph = true;
+        w.guess();
+        assert!(w.extra.oauth_open);
+        assert_eq!(w.extra.oauth_set.take(), Some(true));
+        // A change of account type to IMAP asks nothing.
+        w.graph = false;
+        w.guess();
+        assert_eq!(w.extra.oauth_set, None);
+    }
+
+    #[test]
+    fn sign_in_says_what_is_missing() {
+        // #28: a greyed-out Sign In says why.
+        let mut w = wizard("not an address");
+        w.in_host = "imap.example.com".into();
+        assert_eq!(
+            w.sign_in_missing().as_deref(),
+            Some("To sign in, enter a valid email address and the client id of your app registration.")
+        );
+        w.address = "kim@example.com".into();
+        w.extra.client_id = "app".into();
+        assert_eq!(w.sign_in_missing(), None);
+        w.in_host.clear();
+        assert_eq!(w.sign_in_missing().as_deref(), Some("To sign in, enter the server address."));
+        // Exchange: the EWS address, and Microsoft 365 mailboxes have their own account type.
+        w.ews = true;
+        w.extra.client_id.clear();
+        w.address = "kim".into();
+        let m = w.sign_in_missing().unwrap();
+        assert!(
+            m.starts_with(
+                "To sign in, enter a valid email address, the client id of your app registration and the EWS \
+                 address. Autodiscover cannot find the EWS address without a password"
+            ),
+            "{m}"
+        );
+        assert!(m.contains("Microsoft 365 account type") && m.contains("< Back"), "{m}");
+        w.change = Some(3);
+        assert!(!w.sign_in_missing().unwrap().contains("< Back"), "Change Account keeps the type");
     }
 
     #[test]

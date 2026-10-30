@@ -2,6 +2,18 @@
 
 What changed in each MailCraft release. Help › What's New shows the newest entries from this file.
 
+## Unreleased
+
+- Add Account: "(Not you?)", or another address after an account was added, now sets up a new account and
+  leaves the one already added as it is (it used to change that account, and showed its sign-in state).
+- Add Account: < Back and another account type for the same address replaces the account the wizard added
+  (saving used to fail).
+- Add Account: the "Sign in with OAuth 2.0" section can be closed again after the wizard opened it.
+- Add Account: the "Contacts, Tasks and Calendar Server" section fits the window instead of widening it.
+- Add Account: a greyed-out Sign In says what is still missing (email address, client id or server address);
+  an Exchange account needs its EWS address to sign in with OAuth, and Microsoft 365 mailboxes are pointed
+  at the Microsoft 365 account type.
+
 ## 0.5.0
 
 - Microsoft 365 and Outlook.com accounts through Microsoft Graph: sign in with your Microsoft account; the

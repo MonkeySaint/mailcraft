@@ -888,7 +888,9 @@ fn local_lookup(app: &mut App, servers: &mailcraft_testmail::TestServers) {
     use mailcraft_engine::sync::{ConnectOptions, DiscoverOptions, ResolverChoice};
     app.s.sync.discovery = DiscoverOptions {
         resolver: ResolverChoice::Fixed(servers.dns_addr()),
-        dns_timeout: std::time::Duration::from_secs(2),
+        // The test server always answers, so a long timeout costs nothing; a short one made lookups miss
+        // records (and pick another account type) when a busy machine starved the server's thread.
+        dns_timeout: std::time::Duration::from_secs(10),
         autoconfig_urls: servers.autoconfig_url_templates(),
         http: ConnectOptions::trusting(servers.cert_der.clone()),
         tenant_url: Some(servers.tenant_url_template()),
@@ -1328,4 +1330,239 @@ fn pop_accounts_have_no_offline_window() {
     assert!(h.query_by_label("POP Account Settings").is_some());
     assert!(h.query_by_label("Offline mail").is_none());
     assert!(h.query_by_label(crate::dialogs::accounts::OFFLINE_SLIDER).is_none());
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Add Account wizard: a new account after the first, the OAuth section, the server section's width
+
+/// The Add Account wizard on a session that looks nothing up (gmail.com is known without a lookup).
+fn offline_wizard() -> Harness<'static, App> {
+    let mut app = sample_app();
+    app.s.view.work_offline = true;
+    app.s.sync.discovery = mailcraft_engine::sync::DiscoverOptions::offline();
+    crate::dialogs::open(&mut app, "addAccount", json!({}));
+    harness(app)
+}
+
+/// Scrolls to the control labelled `label` and clicks it.
+fn scroll_click(h: &mut Harness<'_, App>, label: &str) {
+    h.get_by_label(label).scroll_to_me();
+    step(h);
+    h.get_by_label(label).click();
+    step(h);
+}
+
+const OAUTH_HEADER: &str = "Sign in with OAuth 2.0 instead of a password";
+
+#[test]
+fn not_you_after_adding_an_account_adds_another_one() {
+    // Regression (#30): "(Not you?)" kept the account already added, so saving the next address changed that
+    // (Microsoft Graph) account instead of adding one, and showed its sign-in state.
+    let mut h = offline_wizard();
+    let before = h.state().s.mailbox.accounts.len();
+    set_text(&mut h, "Email address:", "robin@m365.example.net");
+    h.get_by_label("Let me set up my account manually").click();
+    step(&mut h);
+    h.get_by_label("Connect").click();
+    step_until(&mut h, "Advanced setup", |h| h.query_by_label("Advanced setup").is_some());
+    h.get_by_label("Microsoft 365").click();
+    wait_for_settings(&mut h, "Microsoft 365 Account Settings");
+    set_text(&mut h, "Client id:", "org-registered-app");
+    scroll_click(&mut h, "Browser");
+    scroll_click(&mut h, "Sign In");
+    let first =
+        h.state().s.mailbox.accounts.iter().find(|a| a.address == "robin@m365.example.net").unwrap().clone();
+    assert_eq!(first.kind, AccountKind::Graph);
+    scroll_click(&mut h, "Cancel Sign-In");
+    assert!(h.query_by_label_contains("Sign-in was cancelled").is_some());
+    // Someone else's address: a new account.
+    h.get_by_label("(Not you?)").click();
+    step(&mut h);
+    assert!(h.query_by_label("Add an email account").is_some());
+    set_text(&mut h, "Email address:", "someone@gmail.com");
+    h.get_by_label("Let me set up my account manually").click();
+    step(&mut h);
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "IMAP Account Settings");
+    assert_eq!(field_value(&h, "Server:"), "imap.gmail.com");
+    assert!(h.query_by_label_contains("Sign-in was cancelled").is_none(), "not the first account's sign-in");
+    set_text(&mut h, "Password:", "app-password");
+    h.get_by_label("Connect").click();
+    step(&mut h);
+    assert!(h.query_by_label("Account successfully added").is_some(), "{:?}", h.state().ui.toast);
+    h.get_by_label("Done").click();
+    step(&mut h);
+    let app = h.state();
+    assert_eq!(app.s.mailbox.accounts.len(), before + 2);
+    let a = app.s.mailbox.account(first.id).unwrap();
+    assert_eq!((a.address.as_str(), a.kind), ("robin@m365.example.net", AccountKind::Graph));
+    assert_eq!(a.incoming, first.incoming, "the first account is unchanged");
+    let b = app.s.mailbox.accounts.iter().find(|a| a.address == "someone@gmail.com").unwrap();
+    assert_eq!(b.kind, AccountKind::Imap);
+    assert_ne!(b.id, first.id);
+    assert_eq!(b.incoming.as_ref().unwrap().host, "imap.gmail.com");
+}
+
+#[test]
+fn another_address_after_back_adds_another_account() {
+    // A changed address on the first page (< Back) is a new account too.
+    let mut h = offline_wizard();
+    let before = h.state().s.mailbox.accounts.len();
+    set_text(&mut h, "Email address:", "ana@example.net");
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "IMAP Account Settings");
+    set_text(&mut h, "Server:", "127.0.0.1");
+    set_text(&mut h, "Outgoing server:", "127.0.0.1");
+    set_text(&mut h, "Password:", "pw");
+    h.get_by_label("Test Account Settings...").click();
+    step(&mut h);
+    let ana = h.state().s.mailbox.accounts.iter().find(|a| a.address == "ana@example.net").unwrap().id;
+    wait_for_report(&mut h, ana.0);
+    h.get_by_label("Close").click();
+    step(&mut h);
+    h.get_by_label("< Back").click();
+    step(&mut h);
+    set_text(&mut h, "Email address:", "lee@example.org");
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "IMAP Account Settings");
+    assert_eq!(field_value(&h, "Server:"), "imap.example.org");
+    set_text(&mut h, "Password:", "pw-lee");
+    h.get_by_label("Connect").click();
+    step(&mut h);
+    assert!(h.query_by_label("Account successfully added").is_some(), "{:?}", h.state().ui.toast);
+    let app = h.state();
+    assert_eq!(app.s.mailbox.accounts.len(), before + 2);
+    let a = app.s.mailbox.account(ana).unwrap();
+    assert_eq!(
+        (a.address.as_str(), a.incoming.as_ref().unwrap().host.as_str()),
+        ("ana@example.net", "127.0.0.1")
+    );
+    assert!(app.s.mailbox.accounts.iter().any(|a| a.address == "lee@example.org" && a.id != ana));
+}
+
+#[test]
+fn another_type_after_back_replaces_the_account_added() {
+    // An account's type cannot be changed by accounts.edit: after < Back and another type for the same
+    // address, the account this wizard added is replaced instead of failing to save.
+    let mut h = offline_wizard();
+    let before = h.state().s.mailbox.accounts.len();
+    set_text(&mut h, "Email address:", "ana@example.net");
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "IMAP Account Settings");
+    set_text(&mut h, "Server:", "127.0.0.1");
+    set_text(&mut h, "Outgoing server:", "127.0.0.1");
+    set_text(&mut h, "Password:", "pw");
+    h.get_by_label("Test Account Settings...").click();
+    step(&mut h);
+    let ana = h.state().s.mailbox.accounts.iter().find(|a| a.address == "ana@example.net").unwrap().id;
+    wait_for_report(&mut h, ana.0);
+    h.get_by_label("Close").click();
+    step(&mut h);
+    h.get_by_label("< Back").click();
+    step(&mut h);
+    h.get_by_label("Let me set up my account manually").click();
+    step(&mut h);
+    h.get_by_label("Connect").click();
+    step(&mut h);
+    h.get_by_label("POP").click();
+    step(&mut h);
+    assert!(h.query_by_label("POP Account Settings").is_some());
+    set_text(&mut h, "Password:", "pw");
+    h.get_by_label("Connect").click();
+    step(&mut h);
+    assert!(h.query_by_label("Account successfully added").is_some(), "{:?}", h.state().ui.toast);
+    let app = h.state();
+    assert_eq!(app.s.mailbox.accounts.len(), before + 1);
+    let a = app.s.mailbox.accounts.iter().find(|a| a.address == "ana@example.net").unwrap();
+    assert_eq!(mailcraft_engine::accounts::kind_label(&app.s, a), "pop3");
+}
+
+#[test]
+fn the_oauth_section_opened_by_the_wizard_can_be_closed() {
+    // Regression (#31): once open, the section was forced open again every frame.
+    let mut h = offline_wizard();
+    set_text(&mut h, "Email address:", "someone@gmail.com");
+    h.get_by_label("Connect").click();
+    wait_for_settings(&mut h, "IMAP Account Settings");
+    assert!(h.query_by_label_contains("no built-in registration").is_some(), "opened for Google");
+    scroll_click(&mut h, OAUTH_HEADER);
+    step(&mut h);
+    assert!(h.query_by_label_contains("no built-in registration").is_none(), "closed");
+    scroll_click(&mut h, OAUTH_HEADER);
+    assert!(h.query_by_label_contains("no built-in registration").is_some(), "open again");
+    assert!(combo_shows(&h, "Google"));
+}
+
+/// The width of the first dialog's window (its area, which grows with contents wider than the window).
+fn dialog_width(h: &Harness<'_, App>) -> f32 {
+    let uid = h.state().ui.dialogs[0].1["_dlg"].as_u64().unwrap();
+    h.ctx.memory(|m| m.area_rect(egui::Id::new(("mc-dialog", uid)))).unwrap().width()
+}
+
+#[test]
+fn the_contacts_tasks_and_calendar_server_section_keeps_the_window_width() {
+    // Regression (#32): expanding the section widened the window (three check boxes on one row, texts that
+    // did not wrap).
+    let mut app = sample_app();
+    let port = closed_port();
+    let v = app
+        .s
+        .run(
+            "accounts.add",
+            &json!({
+                "kind": "imap",
+                "address": "pat@example.net",
+                "incoming": {"host": "127.0.0.1", "port": port, "security": "tls"},
+                "outgoing": {"host": "127.0.0.1", "port": port, "security": "tls"},
+                "password": "pw-local-only",
+                // A DAV password of its own shows the longest texts of the section.
+                "dav": {"url": "https://dav.example.net/", "password": "dav-pw-local-only"},
+            }),
+        )
+        .unwrap();
+    crate::dialogs::open(&mut app, "addAccount", json!({"change": v["account"]}));
+    let mut h = harness(app);
+    let closed = dialog_width(&h);
+    scroll_click(&mut h, "Contacts, Tasks and Calendar Server");
+    step(&mut h);
+    assert!(h.query_by_label("Keep Calendar on the server").is_some());
+    assert!(h.query_by_label_contains("saved password of its own").is_some());
+    let open = dialog_width(&h);
+    assert!(open <= closed + 1.0, "the window grew from {closed} to {open}");
+    // The check boxes are stacked.
+    let contacts = h.get_by_label("Keep Contacts on the server").rect();
+    let tasks = h.get_by_label("Keep Tasks on the server").rect();
+    assert!(tasks.min.y >= contacts.max.y, "{contacts:?} {tasks:?}");
+}
+
+#[test]
+fn a_greyed_out_sign_in_says_what_is_missing() {
+    // #28: an Exchange account without its EWS address cannot sign in with OAuth (Autodiscover needs the
+    // password); the section says so, and points Microsoft 365 mailboxes at their own account type.
+    let mut h = offline_wizard();
+    set_text(&mut h, "Email address:", "robin@corp.example.com");
+    h.get_by_label("Let me set up my account manually").click();
+    step(&mut h);
+    h.get_by_label("Connect").click();
+    step_until(&mut h, "Advanced setup", |h| h.query_by_label("Advanced setup").is_some());
+    h.get_by_label("Exchange").click();
+    wait_for_settings(&mut h, "Exchange Account Settings");
+    scroll_click(&mut h, OAUTH_HEADER);
+    let sign_in_disabled = |h: &Harness<'_, App>| {
+        use egui_kittest::kittest::NodeT;
+        h.get_by_label("Sign In").accesskit_node().is_disabled()
+    };
+    assert!(sign_in_disabled(&h));
+    assert!(
+        h.query_by_label_contains(
+            "To sign in, enter the client id of your app registration and the EWS address."
+        )
+        .is_some()
+    );
+    assert!(h.query_by_label_contains("use the Microsoft 365 account type").is_some());
+    set_text(&mut h, "Client id:", "org-registered-app");
+    assert!(h.query_by_label_contains("To sign in, enter the EWS address.").is_some());
+    set_text(&mut h, "EWS address:", "https://mail.corp.example.com/EWS/Exchange.asmx");
+    assert!(h.query_by_label_contains("To sign in").is_none());
+    assert!(!sign_in_disabled(&h));
 }
