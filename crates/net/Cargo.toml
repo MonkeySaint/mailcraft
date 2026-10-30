@@ -21,6 +21,10 @@ ring.workspace = true
 # OS credential store (see `keychain`).
 keyring.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# DNS servers of the network adapters (see `dns::system_name_servers`).
+ipconfig.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 mailcraft-testmail.workspace = true

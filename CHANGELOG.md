@@ -13,6 +13,11 @@ What changed in each MailCraft release. Help › What's New shows the newest ent
 - Add Account: a greyed-out Sign In says what is still missing (email address, client id or server address);
   an Exchange account needs its EWS address to sign in with OAuth, and Microsoft 365 mailboxes are pointed
   at the Microsoft 365 account type.
+- Windows: account setup looks up SRV and MX records again, using the DNS servers of the active network
+  adapters, so addresses on their own domain are recognised (for example Microsoft 365 by its MX record).
+- Windows: Microsoft sign-ins are kept. Secrets longer than Windows Credential Manager allows (such as
+  Microsoft access tokens) are split over several credentials and checked when read back.
+- A sign-in whose token cannot be saved now shows as failed, with the reason, instead of "Signed in".
 
 ## 0.5.0
 

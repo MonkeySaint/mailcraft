@@ -80,6 +80,9 @@ ring = "0.17.14"
 # OS credential store for account secrets (MIT OR Apache-2.0): Keychain on macOS, Credential Manager on Windows,
 # the Secret Service (D-Bus, pure-Rust zbus) on Linux and the BSDs. The default `v1` feature picks the store.
 keyring = "4.2.0"
+# Windows: the DNS servers of the network adapters (GetAdaptersAddresses) behind a safe API (MIT/Apache-2.0;
+# socket2, widestring and windows-sys, all MIT OR Apache-2.0). Without the registry-reading `computer` feature.
+ipconfig = { version = "0.3.4", default-features = false }
 # test servers: self-signed certificates (ring backend)
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 

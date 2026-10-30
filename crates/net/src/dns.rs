@@ -3,8 +3,8 @@
 //! and MX records (RFC 1035 section 3.3.9, the null MX of RFC 7505). Used for mail service discovery
 //! (RFC 6186, RFC 8314 section 5.1, RFC 8620 section 2.2) and to recognise well-known mail hosts by their MX.
 //!
-//! The resolver to ask comes from `/etc/resolv.conf` (Unix) or is given explicitly (tests use a local fake
-//! responder). Where no resolver is known, lookups are skipped rather than guessed. Every answer is hostile
+//! The resolver to ask comes from `/etc/resolv.conf` (Unix), the DNS servers of the active network adapters
+//! (Windows), or is given explicitly (tests use a local fake responder). Where no resolver is known, lookups are skipped rather than guessed. Every answer is hostile
 //! input: lengths are checked, name compression is bounded, and a malformed message is an error.
 
 use std::io::{Read, Write};
@@ -32,7 +32,10 @@ const MAX_POINTER_JUMPS: usize = 32;
 /// Most records read from one section.
 const MAX_RECORDS: usize = 512;
 /// Largest resolv.conf read.
+#[cfg(unix)]
 const MAX_RESOLV_CONF: u64 = 64 * 1024;
+/// Most system name servers kept.
+const MAX_NAME_SERVERS: usize = 16;
 
 /// One SRV record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,7 +99,7 @@ impl Resolver {
         Resolver { server, timeout: Duration::from_secs(3), attempts: 2 }
     }
 
-    /// The first name server of `/etc/resolv.conf`, if any (always `None` where that file does not exist).
+    /// The first of [`system_name_servers`], if any.
     pub fn system() -> Option<Resolver> {
         system_name_servers().into_iter().next().map(Resolver::new)
     }
@@ -208,7 +211,8 @@ fn random_id() -> Result<u16> {
     Ok(u16::from_be_bytes(b))
 }
 
-/// Name servers listed in `/etc/resolv.conf` (port 53).
+/// The system's name servers (port 53): the `nameserver` lines of `/etc/resolv.conf` on Unix, the DNS servers
+/// of the active network adapters on Windows (see [`adapter_name_servers`]); empty elsewhere.
 pub fn system_name_servers() -> Vec<SocketAddr> {
     #[cfg(unix)]
     {
@@ -217,11 +221,79 @@ pub fn system_name_servers() -> Vec<SocketAddr> {
         if f.take(MAX_RESOLV_CONF).read_to_string(&mut text).is_err() {
             return Vec::new();
         }
-        parse_resolv_conf(&text)
+        let mut out = parse_resolv_conf(&text);
+        out.truncate(MAX_NAME_SERVERS);
+        out
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        match ipconfig::get_adapters() {
+            Ok(list) => {
+                let adapters: Vec<AdapterDns> = list
+                    .iter()
+                    .map(|a| AdapterDns {
+                        up: a.oper_status() == ipconfig::OperStatus::IfOperStatusUp,
+                        has_gateway: !a.gateways().is_empty(),
+                        metric: a.ipv4_metric().min(a.ipv6_metric()),
+                        dns_servers: a.dns_servers().to_vec(),
+                    })
+                    .collect();
+                adapter_name_servers(&adapters)
+            }
+            Err(e) => {
+                log::warn!("cannot list the network adapters for their DNS servers: {e}");
+                Vec::new()
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Vec::new()
+    }
+}
+
+/// What [`adapter_name_servers`] needs to know about one network adapter.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdapterDns {
+    /// Operationally up.
+    pub up: bool,
+    /// Has a default gateway (reaches beyond the local link).
+    pub has_gateway: bool,
+    /// Interface metric (lower is preferred).
+    pub metric: u32,
+    /// The adapter's DNS servers, in its order.
+    pub dns_servers: Vec<IpAddr>,
+}
+
+/// The name servers of network adapters that are up, as port-53 addresses: adapters with a gateway first, then
+/// by metric, each adapter's servers in its own order; duplicates dropped, at most [`MAX_NAME_SERVERS`].
+/// Unusable addresses are skipped: unspecified, broadcast, multicast, IPv6 link-local (no zone id is known) and
+/// the deprecated site-local `fec0::/10` placeholders Windows lists when no IPv6 DNS server is configured.
+pub fn adapter_name_servers(adapters: &[AdapterDns]) -> Vec<SocketAddr> {
+    let mut up: Vec<&AdapterDns> = adapters.iter().filter(|a| a.up).collect();
+    // Stable: adapters of equal rank keep the system's order.
+    up.sort_by_key(|a| (!a.has_gateway, a.metric));
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for ip in up.iter().flat_map(|a| a.dns_servers.iter()) {
+        if out.len() >= MAX_NAME_SERVERS {
+            break;
+        }
+        let addr = SocketAddr::new(*ip, 53);
+        if usable_name_server(ip) && !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+fn usable_name_server(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_multicast() && !v4.is_broadcast(),
+        IpAddr::V6(v6) => {
+            let first = v6.segments().first().copied().unwrap_or_default();
+            // fe80::/10 link-local, fec0::/10 site-local (deprecated by RFC 3879).
+            !v6.is_unspecified() && !v6.is_multicast() && first & 0xffc0 != 0xfe80 && first & 0xffc0 != 0xfec0
+        }
     }
 }
 
@@ -700,11 +772,50 @@ mod tests {
     }
 
     #[test]
+    fn adapter_servers_in_order_without_duplicates() {
+        let adapter = |up, has_gateway, metric, dns: &[&str]| AdapterDns {
+            up,
+            has_gateway,
+            metric,
+            dns_servers: dns.iter().map(|s| s.parse::<IpAddr>().unwrap()).collect(),
+        };
+        let list = [
+            // A virtual switch: up, no gateway.
+            adapter(true, false, 5, &["192.0.2.200"]),
+            // Down: ignored.
+            adapter(false, true, 1, &["192.0.2.99"]),
+            // Wi-Fi with a gateway, higher metric.
+            adapter(true, true, 50, &["192.0.2.2", "192.0.2.1"]),
+            // Ethernet with a gateway, preferred by metric; placeholders, link-local and junk skipped.
+            adapter(
+                true,
+                true,
+                10,
+                &["192.0.2.1", "2001:db8::53", "fec0:0:0:ffff::1", "fe80::1", "0.0.0.0", "::", "ff02::1"],
+            ),
+        ];
+        let got: Vec<String> = adapter_name_servers(&list).iter().map(ToString::to_string).collect();
+        assert_eq!(got, ["192.0.2.1:53", "[2001:db8::53]:53", "192.0.2.2:53", "192.0.2.200:53"]);
+        assert!(adapter_name_servers(&[]).is_empty());
+        assert!(adapter_name_servers(&[adapter(false, true, 1, &["192.0.2.1"])]).is_empty());
+
+        // Capped.
+        let many: Vec<String> = (1..=40).map(|i| format!("192.0.2.{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(adapter_name_servers(&[adapter(true, true, 1, &many)]).len(), MAX_NAME_SERVERS);
+    }
+
+    #[test]
     fn lookup_over_udp_with_tcp_retry() {
         use std::net::TcpListener;
-        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = udp.local_addr().unwrap();
-        let tcp = TcpListener::bind(addr).unwrap();
+        // The same port for UDP and TCP; another socket (a busy machine's other tests) may hold the TCP one.
+        let (udp, addr, tcp) = (0..20)
+            .find_map(|_| {
+                let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let addr = udp.local_addr().unwrap();
+                TcpListener::bind(addr).ok().map(|tcp| (udp, addr, tcp))
+            })
+            .unwrap();
         let recs = vec![srv(0, 1, 993, "imap.example.net")];
         let r2 = recs.clone();
         let h = std::thread::spawn(move || {

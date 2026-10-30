@@ -2372,11 +2372,16 @@ fn apply_all(s: &mut Session, events: Vec<Event>) {
 
 /// Stores refreshed OAuth tokens (access token as the account's secret, refresh token and expiry).
 fn store_tokens(s: &mut Session, account: AccountId, t: &TokenSet) {
-    if let Err(e) = s.secrets.set(&secret_key(account, false), &t.access_token) {
+    if let Err(e) = save_tokens(s, account, t) {
         log::error!("cannot store the renewed sign-in of account {}: {e}", account.0);
         s.notify(Notice::Error(format!("The renewed sign-in could not be saved: {e}")));
-        return;
     }
+}
+
+/// [`store_tokens`] without the notice: an error when the access token could not be stored (nothing changes
+/// then). A refresh token that cannot be stored is only logged: the access token works until it expires.
+fn save_tokens(s: &mut Session, account: AccountId, t: &TokenSet) -> Result<(), String> {
+    s.secrets.set(&secret_key(account, false), &t.access_token)?;
     if let Some(r) = &t.refresh_token
         && s.secrets.get(&refresh_key(account)).as_deref() != Some(r.as_str())
         && let Err(e) = s.secrets.set(&refresh_key(account), r)
@@ -2389,6 +2394,7 @@ fn store_tokens(s: &mut Session, account: AccountId, t: &TokenSet) {
     {
         b.expires_at = exp;
     }
+    Ok(())
 }
 
 fn oauth_done(s: &mut Session, account: AccountId, result: Result<TokenSet, String>) {
@@ -2397,7 +2403,17 @@ fn oauth_done(s: &mut Session, account: AccountId, result: Result<TokenSet, Stri
     let cancelled = s.sync.oauth.get(&account).is_some_and(|f| f.status == "cancelled");
     match result {
         Ok(t) => {
-            store_tokens(s, account, &t);
+            // A sign-in whose token is not kept has not signed anything in: report it as failed.
+            if let Err(e) = save_tokens(s, account, &t) {
+                log::error!("cannot store the sign-in of account {}: {e}", account.0);
+                let why = format!("The sign-in could not be saved in {}: {e}", s.secrets.location());
+                if let Some(f) = s.sync.oauth.get_mut(&account) {
+                    f.status = "failed".into();
+                    f.error = Some(why.clone());
+                }
+                s.notify(Notice::Error(format!("{name}: sign-in failed. {why}")));
+                return;
+            }
             // The token signs in to both servers: an old outgoing password must not shadow it.
             if s.secrets.get(&secret_key(account, true)).is_some() {
                 let _ = s.secrets.remove(&secret_key(account, true));
@@ -3232,6 +3248,65 @@ mod tests {
         s.poll_sync();
         assert_eq!(s.secrets.get(&secret_key(id, false)).as_deref(), Some("at-2"));
         assert_eq!(s.secrets.get(&refresh_key(id)).as_deref(), Some("rt-1"), "kept when not rotated");
+    }
+
+    /// A secret store that keeps short secrets and refuses long ones, like Windows Credential Manager did.
+    #[derive(Default)]
+    struct SmallSecretStore(crate::accounts::MemorySecretStore);
+
+    impl crate::accounts::SecretStore for SmallSecretStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key)
+        }
+        fn set(&mut self, key: &str, secret: &str) -> Result<(), String> {
+            if secret.len() > 100 {
+                return Err("longer than the platform limit".into());
+            }
+            self.0.set(key, secret)
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> {
+            self.0.remove(key)
+        }
+        fn location(&self) -> String {
+            "a small store".into()
+        }
+    }
+
+    #[test]
+    fn sign_in_whose_token_cannot_be_saved_fails() {
+        let (mut s, _, _) = session();
+        let id = imap_account(&mut s);
+        s.secrets = Box::new(SmallSecretStore::default());
+        s.secrets.set(&secret_key(id, true), "old").unwrap();
+        s.sync.oauth.insert(id, crate::sync::OAuthFlow { status: "waiting".into(), ..Default::default() });
+        s.notices.clear();
+        let tokens = |access: String| TokenSet {
+            access_token: access,
+            token_type: "Bearer".into(),
+            expires_at: Some(mailcraft_net::oauth::now_unix() + 3600),
+            refresh_token: Some("rt-1".into()),
+            scope: None,
+            id_token: None,
+        };
+        oauth_done(&mut s, id, Ok(tokens("x".repeat(3000))));
+        let v = crate::sync::oauth_status(&s, id);
+        assert_eq!(v["status"], "failed", "{v}");
+        assert!(v["error"].as_str().unwrap().contains("could not be saved in a small store"), "{v}");
+        assert!(
+            s.notices.iter().any(|n| matches!(n, Notice::Error(e) if e.contains("sign-in failed"))),
+            "{:?}",
+            s.notices
+        );
+        assert!(!s.notices.iter().any(|n| matches!(n, Notice::Info(i) if i.contains("signed in"))));
+        assert_ne!(s.mailbox.account(id).unwrap().credential, CredentialKind::OAuthToken);
+        assert_eq!(s.secrets.get(&secret_key(id, true)).as_deref(), Some("old"), "nothing changed");
+
+        // A token the store takes signs in.
+        s.sync.oauth.insert(id, crate::sync::OAuthFlow { status: "waiting".into(), ..Default::default() });
+        oauth_done(&mut s, id, Ok(tokens("at-1".into())));
+        assert_eq!(crate::sync::oauth_status(&s, id)["status"], "done");
+        assert_eq!(s.secrets.get(&secret_key(id, false)).as_deref(), Some("at-1"));
+        assert_eq!(s.mailbox.account(id).unwrap().credential, CredentialKind::OAuthToken);
     }
 
     #[test]
