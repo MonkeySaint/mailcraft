@@ -673,16 +673,20 @@ pub(crate) fn folder_rows(
             }
             x += 22.0;
         }
-        let font = FontId::proportional(13.0);
-        let galley =
-            ui.painter().layout(label.clone(), font, app.theme.text, (rect.max.x - x - 6.0).max(10.0));
-        let y = rect.center().y - galley.size().y / 2.0;
-        ui.painter().with_clip_rect(rect).galley(pos2(x, y), galley, app.theme.text);
+        let text = folder_row_label(ui, &label, app.theme.text, rect.max.x - x - 6.0);
+        let resp = if text.galley.elided { resp.on_hover_text(&label) } else { resp };
+        text.paint_left(&ui.painter().with_clip_rect(rect), rect, x);
         if resp.clicked() && toggled.is_none() {
             clicked = Some(id);
         }
     }
     (clicked, toggled)
+}
+
+/// A folder row's label on one line, elided with "…" past `width` (a long "Tasks - account" name used to wrap
+/// into a row one line tall and be cut at the top and bottom, issue #27).
+fn folder_row_label(ui: &Ui, label: &str, color: Color32, width: f32) -> crate::list::Text {
+    crate::list::Text::new(ui, label, 13.0, false, color, width.max(10.0), 1)
 }
 
 /// Paints a checkbox square.
@@ -1056,6 +1060,30 @@ mod tests {
         // A closed window's calendar is forgotten (a new one starts from the main window again).
         forget_window(&ctx, other);
         assert_eq!(load_for(&ctx, other).cal.mode, CalendarMode::Week);
+    }
+
+    #[test]
+    fn long_folder_labels_stay_on_one_line() {
+        let ctx = egui::Context::default();
+        let long = "Tasks - another.person.with.a.long.name@second-example.org";
+        let mut seen = None;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let narrow = folder_row_label(ui, long, Color32::WHITE, 160.0);
+            let wide = folder_row_label(ui, "To-Do List", Color32::WHITE, 160.0);
+            seen = Some((
+                narrow.galley.rows.len(),
+                narrow.galley.elided,
+                narrow.width(),
+                wide.galley.rows.len(),
+                wide.galley.elided,
+            ));
+        });
+        out.textures_delta.clear();
+        let (rows, elided, width, wide_rows, wide_elided) = seen.unwrap();
+        assert_eq!(rows, 1, "a long label must not wrap into the one-line row");
+        assert!(elided, "a long label is cut with an ellipsis (and shows the full name on hover)");
+        assert!(width <= 160.5, "the label stays inside the row: {width}");
+        assert_eq!((wide_rows, wide_elided), (1, false), "a short label is drawn whole");
     }
 
     #[test]
