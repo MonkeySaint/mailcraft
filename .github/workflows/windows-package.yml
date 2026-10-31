@@ -1,5 +1,6 @@
-# Builds the Windows MSI on pushes that touch the Windows app or its packaging, and checks that the
-# executable carries the icon resource and the MSI's shortcut icon is readable (packaging/windows/check-icon.ps1).
+# Builds the Windows MSI on pushes that touch the Windows app, the crates it ships, or its packaging, and
+# checks that the executable carries the icon resource and the MSI's shortcut icon is readable
+# (packaging/windows/check-icon.ps1).
 # Nothing is published; the MSI is kept as a run artifact for a few days.
 name: windows-package
 
@@ -8,13 +9,19 @@ on:
     branches: [master]
     paths:
       - apps/mailcraft/**
-      - assets/app-icon/**
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - assets/**
       - packaging/windows/**
       - .github/workflows/windows-package.yml
   pull_request:
     paths:
       - apps/mailcraft/**
-      - assets/app-icon/**
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - assets/**
       - packaging/windows/**
       - .github/workflows/windows-package.yml
   workflow_dispatch:
