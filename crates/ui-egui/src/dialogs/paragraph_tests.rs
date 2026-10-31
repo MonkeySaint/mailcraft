@@ -10,7 +10,7 @@ use mailcraft_engine::sample::sample_session;
 use mailcraft_model::{Block, Inline};
 
 fn harness(app: App) -> Harness<'static, App> {
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+    let mut h = crate::test_harness().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             crate::dialogs::dialogs(&ctx, app);

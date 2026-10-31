@@ -311,7 +311,7 @@ pub(crate) fn show(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Option<Out> {
             let html = crate::compose::clipboard_html();
             let text = crate::compose::clipboard_text();
             // Whether the clipboard holds a picture (asked once per dialog: reading it can be slow).
-            let probe = egui::Id::new(("mc-paste-special-picture", d.uid));
+            let probe = egui::Id::unique(("mc-paste-special-picture", d.uid));
             let has_picture = match ctx.data(|m| m.get_temp::<bool>(probe)) {
                 Some(b) => b,
                 None => {
@@ -1139,7 +1139,7 @@ const MODIFY_STYLE_PROPS: [&str; 10] =
 
 fn word_count(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     // "Include text boxes and shapes" (on by default; remembered while the dialog is open).
-    let include_id = egui::Id::new(("mailcraft-wordcount-drawings", d.uid));
+    let include_id = egui::Id::unique(("mailcraft-wordcount-drawings", d.uid));
     let mut include = ctx.data(|m| m.get_temp::<bool>(include_id)).unwrap_or(true);
     let drawings = d.get("drawings").cloned().unwrap_or(Value::Null);
     let has_drawings = drawings.get("words").and_then(Value::as_u64).unwrap_or(0) > 0

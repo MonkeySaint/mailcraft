@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
-    Color32, EventFilter, FontFamily, FontId, Galley, Id, Key, Modifiers, Painter, Pos2, Rect, Sense, Stroke,
-    Ui, UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
+    Color32, EventFilter, FontFamily, FontId, Galley, Id, Key, Modifiers, Painter, Pos2, Rect, Role, Sense,
+    Stroke, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
 use mailcraft_engine::Session;
 use mailcraft_engine::cmd::view::mail::{self as mailview, ColumnKind, ColumnSpec};
@@ -52,7 +52,7 @@ pub struct DraggedItems(pub Vec<u64>);
 
 /// Id of the list's keyboard-focus widget (the list body).
 pub fn focus_id() -> Id {
-    Id::new("mailcraft.list.focus")
+    Id::unique("mailcraft.list.focus")
 }
 
 /// True while the message list has keyboard focus (Up/Down/Home/End/PgUp/PgDn/Enter belong to the list then).
@@ -329,7 +329,7 @@ struct ListState {
 }
 
 fn state_id() -> Id {
-    Id::new("mailcraft.list.state")
+    Id::unique("mailcraft.list.state")
 }
 
 /// The messages in the main window's list order, the order Previous / Next Item walk
@@ -339,7 +339,7 @@ fn state_id() -> Id {
 /// open.
 pub fn visible_ids(ctx: &egui::Context, s: &Session) -> Arc<Vec<mailcraft_model::ItemId>> {
     let key = fingerprint(s);
-    let id = Id::new("mailcraft.list.visible-ids");
+    let id = Id::unique("mailcraft.list.visible-ids");
     if let Some((k, ids)) = ctx.data(|d| d.get_temp::<(u64, Arc<Vec<mailcraft_model::ItemId>>)>(id))
         && k == key
     {
@@ -670,7 +670,7 @@ struct ScopePrompt {
 }
 
 fn scope_prompt_id() -> Id {
-    Id::new("mailcraft.list.convscope")
+    Id::unique("mailcraft.list.convscope")
 }
 
 /// Asks whether Show as Conversations changes for this folder or for all mailboxes before toggling it
@@ -693,7 +693,7 @@ pub fn conversation_scope_prompt(ctx: &egui::Context, app: &mut App) {
     let Some(p) = ctx.data(|d| d.get_temp::<ScopePrompt>(scope_prompt_id())) else { return };
     // Some(Some(scope)) = answered, Some(None) = cancelled.
     let mut choice: Option<Option<&str>> = None;
-    let modal = egui::Modal::new(Id::new("mailcraft.list.convscope.modal")).show(ctx, |ui| {
+    let modal = egui::Modal::new(Id::unique("mailcraft.list.convscope.modal")).show(ctx, |ui| {
         ui.set_max_width(360.0);
         let text = if p.on {
             "Arrange messages by conversation in:"
@@ -772,7 +772,7 @@ fn header(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode) {
         let color = if on { th.text } else { th.text_muted };
         let t = Text::new(ui, label, 14.0, on, color, 120.0, 1);
         let tab = Rect::from_min_size(pos2(x - 4.0, row_a.top() + 6.0), vec2(t.width() + 8.0, 30.0));
-        let resp = ui.interact(tab, Id::new(("mailcraft.list.tab", i)), Sense::click());
+        let resp = ui.interact(tab, Id::unique(("mailcraft.list.tab", i)), Sense::click());
         if resp.hovered() && !on {
             painter.rect_filled(tab, 3.0, th.hover);
         }
@@ -781,7 +781,7 @@ fn header(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode) {
             let y = tab.bottom() - 2.0;
             painter.line_segment([pos2(x, y), pos2(x + t.width(), y)], Stroke::new(2.0, th.accent));
         }
-        resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, on, *label));
+        resp.widget_info(|| WidgetInfo::selected(Role::Button, true, on, *label));
         if resp.clicked() && !on {
             if c.focused_tabs {
                 let tab = if i == 0 { "focused" } else { "other" };
@@ -797,7 +797,7 @@ fn header(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode) {
     // Sort direction (right edge).
     let desc = c.vs.order == SortOrder::Descending;
     let sort_rect = Rect::from_min_size(pos2(row_a.right() - 32.0, row_a.top() + 8.0), vec2(24.0, 24.0));
-    let sort_resp = ui.interact(sort_rect, Id::new("mailcraft.list.sortdir"), Sense::click());
+    let sort_resp = ui.interact(sort_rect, Id::unique("mailcraft.list.sortdir"), Sense::click());
     if sort_resp.hovered() {
         painter.rect_filled(sort_rect, 3.0, th.hover);
     }
@@ -810,7 +810,7 @@ fn header(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode) {
         (_, true) => "Sorted descending",
         (_, false) => "Sorted ascending",
     };
-    sort_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, sort_tip));
+    sort_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, sort_tip));
     let sort_resp = sort_resp.on_hover_text(sort_tip);
     if sort_resp.clicked() {
         run(ui, app, "view.reverseSort", json!({}));
@@ -821,13 +821,13 @@ fn header(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode) {
     let t = Text::new(ui, &by, 13.0, false, th.text, 160.0, 1);
     let bw = t.width() + 30.0;
     let by_rect = Rect::from_min_size(pos2(sort_rect.left() - 4.0 - bw, row_a.top() + 8.0), vec2(bw, 24.0));
-    let by_resp = ui.interact(by_rect, Id::new("mailcraft.list.arrange"), Sense::click());
+    let by_resp = ui.interact(by_rect, Id::unique("mailcraft.list.arrange"), Sense::click());
     if by_resp.hovered() {
         painter.rect_filled(by_rect, 3.0, th.hover);
     }
     let end = t.paint_left(&painter, by_rect, by_rect.left() + 8.0);
     app.icons.paint(ui, icon_rect(pos2(end + 10.0, by_rect.center().y), 12.0), "chevron-down", th.text_muted);
-    by_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &by));
+    by_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &by));
     egui::Popup::menu(&by_resp).show(|ui| crate::menus::arrange_menu(ui, app));
 
     // Row B: "Other: New messages (N)" banner (only while there is new Other mail).
@@ -836,7 +836,7 @@ fn header(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode) {
         vec2(rect.width(), 30.0),
     );
     if let Some((n, senders)) = &c.other_new {
-        let resp = ui.interact(row_b, Id::new("mailcraft.list.otherbanner"), Sense::click());
+        let resp = ui.interact(row_b, Id::unique("mailcraft.list.otherbanner"), Sense::click());
         if resp.hovered() {
             painter.rect_filled(row_b.shrink2(vec2(6.0, 1.0)), 3.0, th.hover);
         }
@@ -848,7 +848,7 @@ fn header(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode) {
             let s = Text::new(ui, senders, 12.0, false, th.text_muted, rest, 1);
             s.paint_left(&painter, row_b, end + 8.0);
         }
-        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{label} {senders}")));
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("{label} {senders}")));
         if resp.clicked() {
             run(ui, app, "view.focusedTab", json!({ "tab": "other" }));
         }
@@ -857,8 +857,8 @@ fn header(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode) {
     if let Some(notice) = &c.search_notice {
         let t = Text::new(ui, notice, 12.0, false, th.text_muted, row_b.width() - 24.0, 2);
         t.paint_left(&painter, row_b, row_b.left() + 12.0);
-        let resp = ui.interact(row_b, Id::new("mailcraft.list.searchnotice"), Sense::hover());
-        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, notice));
+        let resp = ui.interact(row_b, Id::unique("mailcraft.list.searchnotice"), Sense::hover());
+        resp.widget_info(|| WidgetInfo::labeled(Role::Label, true, notice));
         resp.on_hover_text(notice);
     }
 
@@ -880,7 +880,7 @@ fn outgoing(role: Option<FolderRole>) -> bool {
 
 /// Id of a column's resize drag (memory holds the px dragged so far).
 fn resize_id(col: &str) -> Id {
-    Id::new(("mailcraft.list.colsize", col))
+    Id::unique(("mailcraft.list.colsize", col))
 }
 
 fn column_header(ui: &mut Ui, app: &mut App, c: &Cached, row: Rect) {
@@ -892,7 +892,7 @@ fn column_header(ui: &mut Ui, app: &mut App, c: &Cached, row: Rect) {
     for (i, x, w) in layout_columns(&c.columns, row.width()) {
         let Some(col) = c.columns.get(i) else { continue };
         let cell = Rect::from_min_size(pos2(row.left() + x, row.top()), vec2(w, row.height()));
-        let resp = ui.interact(cell, Id::new(("mailcraft.list.colhdr", col.id)), Sense::click());
+        let resp = ui.interact(cell, Id::unique(("mailcraft.list.colhdr", col.id)), Sense::click());
         let arrange = column_arrange(col, out);
         if resp.hovered() && arrange.is_some() {
             painter.rect_filled(cell, 0.0, th.hover);
@@ -930,7 +930,7 @@ fn column_header(ui: &mut Ui, app: &mut App, c: &Cached, row: Rect) {
             [pos2(cell.right() - 0.5, cell.top() + 5.0), pos2(cell.right() - 0.5, cell.bottom() - 5.0)],
             Stroke::new(1.0, th.separator),
         );
-        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &name));
         let resp = resp.on_hover_text(&name);
         if resp.clicked()
             && let Some(a) = arrange
@@ -950,7 +950,7 @@ fn column_header(ui: &mut Ui, app: &mut App, c: &Cached, row: Rect) {
 
         // Right edge: drag to resize (committed as the column's width when released).
         let edge = Rect::from_center_size(pos2(cell.right(), cell.center().y), vec2(6.0, row.height()));
-        let grip = ui.interact(edge, Id::new(("mailcraft.list.colgrip", col.id)), Sense::drag());
+        let grip = ui.interact(edge, Id::unique(("mailcraft.list.colgrip", col.id)), Sense::drag());
         let grip = grip.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
         let rid = resize_id(col.id);
         if grip.dragged() {
@@ -998,11 +998,11 @@ fn body(ui: &mut Ui, app: &mut App, c: &Cached, rect: Rect, mode: Mode, st: &mut
         let msg = if c.searching { "No results found." } else { "Nothing to show in this view." };
         let t = Text::new(ui, msg, 13.0, false, th.text_muted, rect.width() - 24.0, 2);
         t.paint(ui.painter(), pos2(rect.center().x - t.width() / 2.0, rect.top() + 32.0));
-        bg.widget_info(|| WidgetInfo::labeled(WidgetType::Other, true, "Message list, empty"));
+        bg.widget_info(|| WidgetInfo::labeled(Role::Unknown, true, "Message list, empty"));
         st.last_focus = app.s.selection.focus.map(|f| f.0);
         return;
     }
-    bg.widget_info(|| WidgetInfo::labeled(WidgetType::Other, true, "Message list"));
+    bg.widget_info(|| WidgetInfo::labeled(Role::Unknown, true, "Message list"));
 
     let item_h = item_height(mode, c.vs.preview_lines, c.vs.tighter_spacing);
     let child_h = child_height(mode, c.vs.preview_lines, c.vs.tighter_spacing);
@@ -1185,7 +1185,7 @@ fn toggle_group(ui: &Ui, app: &mut App, label: &str, collapsed: bool) {
 #[allow(clippy::too_many_arguments)]
 fn group_row(ui: &mut Ui, app: &mut App, r: Rect, label: &str, count: usize, collapsed: bool, depth: u8) {
     let th = app.theme.clone();
-    let resp = ui.interact(r, Id::new(("mailcraft.list.group", label)), Sense::click());
+    let resp = ui.interact(r, Id::unique(("mailcraft.list.group", label)), Sense::click());
     let painter = ui.painter().clone();
     let fill = if resp.hovered() { th.hover } else { th.group_header };
     painter.rect_filled(r.shrink2(vec2(0.0, 1.0)), 0.0, fill);
@@ -1202,9 +1202,7 @@ fn group_row(ui: &mut Ui, app: &mut App, r: Rect, label: &str, count: usize, col
     let t = Text::new(ui, title, 12.5, true, th.text, (r.width() - 40.0 - indent).max(1.0), 1);
     t.paint_left(&painter, r, r.left() + 26.0 + indent);
     let state = if collapsed { "collapsed" } else { "expanded" };
-    resp.widget_info(|| {
-        WidgetInfo::labeled(WidgetType::CollapsingHeader, true, format!("{title}: {count} items, {state}"))
-    });
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("{title}: {count} items, {state}")));
     if resp.clicked() {
         toggle_group(ui, app, label, collapsed);
     }
@@ -1369,7 +1367,7 @@ fn item_row(
     // A message listed again (under each of its categories) gets its own ids too.
     let part: u32 =
         if row.conversation.as_ref().is_some_and(|c| c.header) { 1 } else { 0 } + 2 * u32::from(row.repeat);
-    let resp = ui.interact(r, Id::new(("mailcraft.list.row", id, part)), Sense::click_and_drag());
+    let resp = ui.interact(r, Id::unique(("mailcraft.list.row", id, part)), Sense::click_and_drag());
     let hovered = resp.contains_pointer() && !egui::DragAndDrop::has_any_payload(ui.ctx());
     // The hovered message for hover shortcuts; header rows leave it to the message's own (child) row.
     if part.is_multiple_of(2) && row.kind.is_none() {
@@ -1411,7 +1409,7 @@ fn item_row(
     // A non-mail result of an All Items search opens its own item window; message actions do not apply.
     if let Some(window) = row.kind.as_deref() {
         let accessible = row.accessible.trim_end_matches([',', ' ']).to_owned();
-        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &accessible));
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, &accessible));
         if resp.double_clicked() || (resp.clicked() && frame.single_pane) {
             crate::dialogs::open(app, window, json!({ "id": id }));
         }
@@ -1428,7 +1426,7 @@ fn item_row(
     if flag_active(c)
         && let Some(flag) = slots.flag
     {
-        let flag_resp = ui.interact(flag, Id::new(("mailcraft.list.flag", id, part)), Sense::click());
+        let flag_resp = ui.interact(flag, Id::unique(("mailcraft.list.flag", id, part)), Sense::click());
         let flag_tip = if row.flag_complete {
             "Clear flag"
         } else if row.flagged {
@@ -1439,31 +1437,31 @@ fn item_row(
         if flag_resp.hovered() {
             outline(flag);
         }
-        flag_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, flag_tip));
+        flag_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, flag_tip));
         if flag_resp.on_hover_text(flag_tip).clicked() {
             let params = if row.flag_complete { json!({ "kind": "clear" }) } else { json!({}) };
             run_on_items(ui, app, "mail.flag", &[id], params);
         }
     }
     if let Some(cat) = slots.category {
-        let cat_resp = ui.interact(cat, Id::new(("mailcraft.list.category", id, part)), Sense::click());
+        let cat_resp = ui.interact(cat, Id::unique(("mailcraft.list.category", id, part)), Sense::click());
         if cat_resp.hovered() {
             outline(cat);
         }
         let label = if row.categories.is_empty() { "No Categories" } else { "Categories" };
-        cat_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+        cat_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
         if cat_resp.on_hover_text("Quick Click category").clicked() {
             run_on_items(ui, app, "mail.categorize", &[id], json!({}));
         }
     }
     for (action, rect) in &slots.actions {
         let a_resp =
-            ui.interact(*rect, Id::new(("mailcraft.list.action", id, part, *action)), Sense::click());
+            ui.interact(*rect, Id::unique(("mailcraft.list.action", id, part, *action)), Sense::click());
         if a_resp.hovered() {
             outline(*rect);
         }
         let (_, label) = action_look(action, row);
-        a_resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+        a_resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
         if a_resp.on_hover_text(label).clicked() {
             run_action(ui, app, action, id);
         }
@@ -1505,7 +1503,7 @@ fn item_row(
         run(ui, app, "nav.selectItem", json!({ "id": id }));
     }
     let accessible = row.accessible.trim_end_matches([',', ' ']).to_owned();
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, row.selected, &accessible));
+    resp.widget_info(|| WidgetInfo::selected(Role::Button, true, row.selected, &accessible));
     if conv.is_some_and(|cv| cv.header) {
         resp.context_menu(|ui| crate::menus::conversation_menu(ui, app, id));
     } else {
@@ -1531,7 +1529,7 @@ fn paint_conversation_glyph(painter: &Painter, c: Pos2, expanded: bool, color: C
 
 /// The glyph of a header row toggles the conversation without changing the selection.
 fn conversation_glyph(ui: &Ui, app: &mut App, g: Rect, row: &ItemRow, cv: &ConversationRow) {
-    let resp = ui.interact(g, Id::new(("mailcraft.list.convglyph", row.id.0)), Sense::click());
+    let resp = ui.interact(g, Id::unique(("mailcraft.list.convglyph", row.id.0)), Sense::click());
     let label = if cv.expanded { "Collapse conversation" } else { "Expand conversation" };
     if resp.hovered() {
         ui.painter().rect_stroke(
@@ -1541,7 +1539,7 @@ fn conversation_glyph(ui: &Ui, app: &mut App, g: Rect, row: &ItemRow, cv: &Conve
             egui::StrokeKind::Inside,
         );
     }
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
     if resp.on_hover_text(label).clicked() {
         let id = if cv.expanded { "view.collapseGroup" } else { "view.expandGroup" };
         run(ui, app, id, json!({ "conversation": true, "id": row.id.0 }));
@@ -2047,7 +2045,7 @@ fn drag_preview(ui: &Ui, app: &App) {
     let verb = if copy { "Copy" } else { "Move" };
     let label = if n == 1 { format!("{verb} 1 item") } else { format!("{verb} {n} items") };
     let painter =
-        ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("mailcraft.list.dragchip")));
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::unique("mailcraft.list.dragchip")));
     let galley = painter.layout_no_wrap(label, FontId::proportional(12.5), app.theme.text);
     let rect = Rect::from_min_size(pos + vec2(14.0, 10.0), galley.size() + vec2(16.0, 8.0));
     painter.rect_filled(rect, 4.0, app.theme.pane);
@@ -2080,7 +2078,7 @@ mod tests {
     use mailcraft_engine::sample::sample_session;
 
     fn harness(app: App, size: egui::Vec2) -> Harness<'static, App> {
-        Harness::builder().with_size(size).build_ui_state(
+        crate::test_harness().with_size(size).build_ui_state(
             |ui, app: &mut App| {
                 let frame = Frame::compute(1600.0, 900.0);
                 message_list(ui, app, &frame);
@@ -2660,7 +2658,7 @@ mod tests {
     #[test]
     fn conversation_settings_menu_reflects_engine_state() {
         let (s, _) = conv_session();
-        let mut h = Harness::builder().with_size(vec2(400.0, 300.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(vec2(400.0, 300.0)).build_ui_state(
             |ui, app: &mut App| crate::menus::conversation_settings_menu(ui, app),
             App::new(s),
         );

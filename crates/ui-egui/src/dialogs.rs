@@ -500,7 +500,7 @@ fn strip_uid(p: &Value) -> Value {
 }
 
 fn assign_uids(ctx: &Context, app: &mut App) {
-    let counter = Id::new("mc-dialog-next-uid");
+    let counter = Id::unique("mc-dialog-next-uid");
     for (_, p) in &mut app.ui.dialogs {
         if uid_of(p) != 0 {
             continue;

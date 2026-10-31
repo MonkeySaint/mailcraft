@@ -270,7 +270,7 @@ pub(crate) fn show(ui: &mut Ui, app: &App, ed: &mut ApptEditor) {
     let height = ROW_H * (names.len() as f32 + 1.0);
     egui::ScrollArea::horizontal().id_salt("mc-sched-scroll").show(ui, |ui| {
         let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
-        a11y(&resp, egui::WidgetType::Other, "Scheduling grid");
+        a11y(&resp, egui::Role::Unknown, "Scheduling grid");
         let p = ui.painter().with_clip_rect(rect);
         let theme = &app.theme;
         let x_of = |minute: i64| rect.min.x + NAME_W + ((minute - FIRST_HOUR * 60) as f32 / 30.0) * SLOT_W;
@@ -310,8 +310,9 @@ pub(crate) fn show(ui: &mut Ui, app: &App, ed: &mut ApptEditor) {
                     let r = Rect::from_min_max(pos2(x_of(s), lane.min.y), pos2(x_of(e), lane.max.y));
                     p.rect_filled(r, CornerRadius::same(2), show_as_fill(app, &b.show_as));
                     let label = block_label(b, s, e, details);
-                    let block = ui.interact(r, ui.id().with(("mc-sched-busy", b.id, s)), Sense::hover());
-                    a11y(&block, egui::WidgetType::Other, &label);
+                    let block =
+                        ui.interact(r, ui.scope_id().with(("mc-sched-busy", b.id, s)), Sense::hover());
+                    a11y(&block, egui::Role::Unknown, &label);
                     if details {
                         let text = if b.private { "Private appointment" } else { b.subject.trim() };
                         let clip = p.with_clip_rect(r.shrink(1.0));
@@ -343,8 +344,8 @@ pub(crate) fn show(ui: &mut Ui, app: &App, ed: &mut ApptEditor) {
                         private: false,
                     };
                     let label = format!("{name}: {}", block_label(&slot, s, e, false));
-                    let block = ui.interact(r, ui.id().with(("mc-sched-att", i, s)), Sense::hover());
-                    a11y(&block, egui::WidgetType::Other, &label);
+                    let block = ui.interact(r, ui.scope_id().with(("mc-sched-att", i, s)), Sense::hover());
+                    a11y(&block, egui::Role::Unknown, &label);
                     block.on_hover_text(label);
                 }
             } else {
@@ -448,7 +449,7 @@ mod tests {
         let grid = |details: bool| {
             let mut app = App::new(sample_session());
             app.run("options.set", serde_json::json!({"key": "calendar.gridDetails", "value": details}));
-            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1000.0, 400.0)).build_ui_state(
+            let mut h = crate::test_harness().with_size(egui::vec2(1000.0, 400.0)).build_ui_state(
                 |ui, app: &mut App| {
                     let mut ed = editor("2026-10-09", 8 * 60 + 30, 9 * 60 + 30);
                     show(ui, app, &mut ed);
@@ -499,7 +500,7 @@ mod tests {
         let app = App::new(s);
         let mut ed = editor("2026-11-05", 14 * 60, 15 * 60 + 30);
         ed.attendees = format!("Bob Example <{BOB}>; nobody@example.net");
-        let mut h = egui_kittest::Harness::builder()
+        let mut h = crate::test_harness()
             .with_size(egui::vec2(1000.0, 400.0))
             .build_ui_state(move |ui, app: &mut App| show(ui, app, &mut ed), app);
         let label = format!("Bob Example <{BOB}>: Tentative, 3:00 PM - 4:00 PM");

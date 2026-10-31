@@ -112,7 +112,7 @@ struct Table {
 }
 
 fn table_id(ui: &Ui) -> Id {
-    egui::containers::menu::find_menu_root(ui).id.with("mc-menu-access-keys")
+    egui::containers::menu::find_menu_root(ui).unique_id.with("mc-menu-access-keys")
 }
 
 /// Records that entry `row` was drawn as widget `widget` (so a shared key moves on from the focused one).
@@ -125,7 +125,7 @@ pub fn drawn(ui: &Ui, row: Id, widget: Id) {
 /// to it.
 pub fn access(ui: &Ui, row: Id, key: Option<Access>, enabled: bool) -> Hit {
     let ctx = ui.ctx().clone();
-    let root = egui::containers::menu::find_menu_root(ui).id;
+    let root = egui::containers::menu::find_menu_root(ui).unique_id;
     let deepest = egui::containers::menu::MenuState::from_id(&ctx, root, |s| s.open_item.is_none());
     let pass = ctx.cumulative_pass_nr();
     let table_id = table_id(ui);
@@ -214,7 +214,7 @@ pub fn key_char(key: Key) -> Option<char> {
 pub fn open_submenu(ui: &Ui, button: Id) {
     use egui::containers::menu::{MenuState, SubMenu};
     let ctx = ui.ctx();
-    let root = egui::containers::menu::find_menu_root(ui).id;
+    let root = egui::containers::menu::find_menu_root(ui).unique_id;
     let sub = SubMenu::id_from_widget_id(button);
     // A submenu counts as open only once shown; mark it so the parent keeps it open this frame.
     MenuState::mark_shown(ctx, sub);
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn shared_keys_cycle_the_focus() {
-        let (a, b, c) = (Id::new("a"), Id::new("b"), Id::new("c"));
+        let (a, b, c) = (Id::unique("a"), Id::unique("b"), Id::unique("c"));
         let s = Access::plain('S').unwrap();
         let rows = vec![(s, a, true), (Access::plain('M').unwrap(), b, true), (s, c, true)];
         assert_eq!(resolve(&rows, Access::plain('M').unwrap(), None), Some((b, Hit::Activate)));

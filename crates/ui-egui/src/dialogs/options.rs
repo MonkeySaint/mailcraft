@@ -582,7 +582,7 @@ mod tests {
     use mailcraft_engine::sample::sample_session;
 
     fn harness(app: App) -> Harness<'static, App> {
-        Harness::builder().with_size(egui::Vec2::new(1200.0, 900.0)).build_ui_state(
+        crate::test_harness().with_size(egui::Vec2::new(1200.0, 900.0)).build_ui_state(
             |ui, app: &mut App| {
                 let ctx = ui.ctx().clone();
                 crate::dialogs::dialogs(&ctx, app);

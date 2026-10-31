@@ -13,6 +13,9 @@ What changed in each MailCraft release. Help › What's New shows the newest ent
 - Troubleshooting logging also records start-up times (profile opened, window and renderer ready, first
   frame). `MAILCRAFT_RENDERER=wgpu` draws with wgpu (Direct3D 12 on Windows, Vulkan or Metal elsewhere)
   instead of OpenGL, to compare on machines where windows open slowly.
+- With a message open in its own window, the main window and the message window no longer lay out all of
+  their text again on every frame (each window threw away the other's text layouts), so both stay
+  responsive. The user interface toolkit (egui) is updated to 0.37 for this.
 
 ## 0.5.1
 

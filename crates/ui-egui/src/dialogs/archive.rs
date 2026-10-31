@@ -447,7 +447,7 @@ pub(crate) struct Tick {
 }
 
 fn tick_id() -> Id {
-    Id::new("mc-auto-archive-tick")
+    Id::unique("mc-auto-archive-tick")
 }
 
 pub(crate) fn load_tick(ctx: &Context) -> Tick {

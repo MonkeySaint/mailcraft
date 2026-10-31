@@ -454,7 +454,7 @@ struct FlagDlg {
 fn flag_to(ui: &mut Ui, id: (&'static str, u64), label: &mut String) {
     ui.horizontal(|ui| {
         let r = ui.add(egui::TextEdit::singleline(label).desired_width(180.0));
-        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Flag to"));
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Flag to"));
         egui::ComboBox::from_id_salt(id).selected_text("").width(24.0).show_ui(ui, |ui| {
             for f in FLAG_TO {
                 if ui.selectable_label(label == f, f).clicked() {

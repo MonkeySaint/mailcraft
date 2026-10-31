@@ -15,7 +15,7 @@ use super::super::common::{load, store};
 use crate::App;
 
 fn harness(app: App) -> Harness<'static, App> {
-    let mut h = Harness::builder()
+    let mut h = crate::test_harness()
         .with_size(vec2(1400.0, 900.0))
         .build_ui_state(|ui: &mut egui::Ui, app: &mut App| super::super::calendar(ui, app), app);
     h.run_ok();

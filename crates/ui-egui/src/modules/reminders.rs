@@ -52,7 +52,7 @@ pub(crate) struct RemindersUi {
 }
 
 fn state_id() -> Id {
-    Id::new("mailcraft.modules.reminders")
+    Id::unique("mailcraft.modules.reminders")
 }
 
 pub(crate) fn load(ctx: &egui::Context) -> RemindersUi {
@@ -187,7 +187,7 @@ fn window(ctx: &egui::Context, app: &mut App, st: &mut RemindersUi) {
     let mut open = true;
     let mut action: Option<(&'static str, Value)> = None;
     egui::Window::new(title)
-        .id(Id::new("mc-reminders-window"))
+        .id(Id::unique("mc-reminders-window"))
         .open(&mut open)
         .collapsible(false)
         .resizable(true)

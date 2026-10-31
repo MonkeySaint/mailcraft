@@ -23,7 +23,7 @@ fn app_with_body(text: &str) -> (App, u64) {
 }
 
 fn harness(app: App) -> Harness<'static, App> {
-    Harness::builder().with_size([1600.0, 1000.0]).build_ui_state(
+    crate::test_harness().with_size([1600.0, 1000.0]).build_ui_state(
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             compose_windows(&ctx, app);

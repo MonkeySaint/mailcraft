@@ -745,12 +745,11 @@ fn editor_rows_keep_message_options() {
 #[cfg(test)]
 #[test]
 fn show_options_edits_a_forward_step() {
-    use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
     let mut app = App::new(mailcraft_engine::sample::sample_session());
     let id = app.s.mailbox.quick_steps.iter().find(|q| q.name == "To Manager").map(|q| q.id).unwrap();
     app.run("quicksteps.edit", json!({"id": id}));
-    let mut h = Harness::builder()
+    let mut h = crate::test_harness()
         .with_size(egui::vec2(900.0, 900.0))
         .build_ui_state(|ui, app: &mut App| crate::dialogs::dialogs(&ui.ctx().clone(), app), app);
     h.run();

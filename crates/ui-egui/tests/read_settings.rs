@@ -13,17 +13,21 @@ use serde_json::json;
 
 fn build(app: App, w: f32, h: f32) -> Harness<'static, App> {
     let mut fonts_done = false;
-    let mut h = Harness::builder().with_size(egui::vec2(w, h)).build_ui_state(
-        move |ui, app: &mut App| {
-            if !fonts_done {
-                App::install_fonts(ui.ctx());
-                fonts_done = true;
-            }
-            ui.ctx().set_embed_viewports(true);
-            app.ui_root(ui);
-        },
-        app,
-    );
+    let mut h = Harness::builder()
+        .with_accessibility_check(false)
+        .allow_missing_glyphs()
+        .with_size(egui::vec2(w, h))
+        .build_ui_state(
+            move |ui, app: &mut App| {
+                if !fonts_done {
+                    App::install_fonts(ui.ctx());
+                    fonts_done = true;
+                }
+                ui.ctx().set_embed_viewports(true);
+                app.ui_root(ui);
+            },
+            app,
+        );
     h.run_steps(4);
     h
 }

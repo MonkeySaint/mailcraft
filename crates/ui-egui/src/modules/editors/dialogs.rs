@@ -545,7 +545,7 @@ fn close_deleted_task(st: &mut ModState, ids: &[u64]) {
 
 fn window<'a>(title: &str, nonce: u64) -> egui::Window<'a> {
     egui::Window::new(title.to_owned())
-        .id(Id::new(("mc-module-dialog", nonce)))
+        .id(Id::unique(("mc-module-dialog", nonce)))
         .collapsible(false)
         .resizable(true)
         .default_width(440.0)

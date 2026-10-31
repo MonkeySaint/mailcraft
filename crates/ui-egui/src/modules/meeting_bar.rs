@@ -39,11 +39,11 @@ struct Propose {
 }
 
 fn cache_id() -> Id {
-    Id::new("mailcraft.modules.meeting-cache")
+    Id::unique("mailcraft.modules.meeting-cache")
 }
 
 fn task_cache_id() -> Id {
-    Id::new("mailcraft.modules.task-message-cache")
+    Id::unique("mailcraft.modules.task-message-cache")
 }
 
 /// The parsed task part of the message shown last.
@@ -55,7 +55,7 @@ struct TaskCache {
 }
 
 fn propose_id() -> Id {
-    Id::new("mailcraft.modules.meeting-propose")
+    Id::unique("mailcraft.modules.meeting-propose")
 }
 
 /// The meeting summary for `mail`, or `None` when it carries no calendar part.
@@ -338,7 +338,7 @@ fn propose_window(ctx: &egui::Context, app: &mut App) {
     let mut open = true;
     let mut done = false;
     egui::Window::new("Propose New Time")
-        .id(Id::new(("mc-propose", p.mail)))
+        .id(Id::unique(("mc-propose", p.mail)))
         .collapsible(false)
         .resizable(false)
         .open(&mut open)

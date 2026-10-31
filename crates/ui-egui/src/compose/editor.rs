@@ -47,8 +47,8 @@
 //! (a private session) as well as a compose window body.
 
 use egui::{
-    Color32, CursorIcon, Event, EventFilter, Id, Key, Modifiers, Pos2, Rect, Sense, Shape, Stroke, Ui,
-    UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
+    Color32, CursorIcon, Event, EventFilter, Id, Key, Modifiers, Pos2, Rect, Role, Sense, Shape, Stroke, Ui,
+    UiBuilder, WidgetInfo, pos2, vec2,
 };
 use serde_json::{Value, json};
 
@@ -82,7 +82,7 @@ pub const NO_SUGGESTIONS: &str = "(No spelling suggestions)";
 /// The egui id of the body editor of compose `cid` (focus target; also used by `keys` to tell whether the body
 /// has keyboard focus).
 pub fn editor_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-body", cid))
+    Id::unique(("mailcraft-compose-body", cid))
 }
 
 /// Whether the body editor of compose `cid` has keyboard focus.
@@ -241,7 +241,7 @@ struct PreviewRequest {
 }
 
 fn preview_request_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-live-preview", cid))
+    Id::unique(("mailcraft-compose-live-preview", cid))
 }
 
 /// Live Preview (File › Options › General › "Enable Live Preview"): a gallery calls this every frame the
@@ -312,7 +312,7 @@ pub const PASTE_MODES: [(&str, &str); 3] =
     [("keepSource", "Keep Source Formatting"), ("merge", "Merge Formatting"), ("textOnly", "Keep Text Only")];
 
 fn paste_mode_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-paste-mode", cid))
+    Id::unique(("mailcraft-compose-paste-mode", cid))
 }
 
 /// Pastes the system clipboard into compose `cid` with `mode` (ribbon Paste › Keep Source Formatting /
@@ -873,11 +873,11 @@ fn take_actions(ui: &Ui) -> Vec<Act> {
 }
 
 fn last_paste_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-last-paste", cid))
+    Id::unique(("mailcraft-compose-last-paste", cid))
 }
 
 fn last_copy_id() -> Id {
-    Id::new("mailcraft-compose-last-copy")
+    Id::unique("mailcraft-compose-last-copy")
 }
 
 /// The text the last Copy / Cut in a message body put on the clipboard, and the compose it came from.
@@ -954,7 +954,7 @@ pub(crate) fn paste_clipboard(
 }
 
 fn refocus_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-refocus", cid))
+    Id::unique(("mailcraft-compose-refocus", cid))
 }
 
 /// Gives the body editor of compose `cid` keyboard focus again once the click that ran a ribbon command is
@@ -1841,7 +1841,7 @@ pub(crate) fn body_editor_in(
 
     // The editor's interaction, on top of the painted body.
     let resp = ui.interact(rect, id, Sense::click_and_drag());
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, BODY_LABEL));
+    resp.widget_info(|| WidgetInfo::labeled(Role::TextInput, true, BODY_LABEL));
     let body_start = c.body_start();
     let Mem { view, doc, preferred_x, drag_anchor, reveal, menu, paint_due, .. } = &mut mem;
     let layout = view.layout.as_ref();

@@ -1033,7 +1033,7 @@ fn save_items_prompt(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
 }
 
 fn window<'a>(title: String, id: (&'static str, u64)) -> egui::Window<'a> {
-    egui::Window::new(title).id(Id::new(id)).collapsible(false).resizable(true).default_width(560.0)
+    egui::Window::new(title).id(Id::unique(id)).collapsible(false).resizable(true).default_width(560.0)
 }
 
 fn field(ui: &mut Ui, label: &str, text: &mut String, hint: &str) -> egui::Response {
@@ -1910,7 +1910,7 @@ pub(crate) fn business_card(ui: &mut Ui, app: &App, c: &Contact, width: f32) {
             ui.set_width(width);
             ui.horizontal_top(|ui| {
                 let (r, resp) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
-                super::common::a11y(&resp, egui::WidgetType::Image, "Contact picture");
+                super::common::a11y(&resp, egui::Role::Image, "Contact picture");
                 let name = lines.first().cloned().unwrap_or_default();
                 if !super::common::paint_contact_picture(ui, r, c) {
                     let idx = name.bytes().fold(0u8, |a, b| a.wrapping_add(b));
@@ -2473,7 +2473,7 @@ fn member_picker(ctx: &egui::Context, app: &App, ed: &mut ContactEditor) {
     let mut done = false;
     let title = if p.address_book { "Select Members: Address Book" } else { "Select Members: Contacts" };
     egui::Window::new(title)
-        .id(Id::new(("mc-member-picker", ed.nonce)))
+        .id(Id::unique(("mc-member-picker", ed.nonce)))
         .order(egui::Order::Foreground)
         .collapsible(false)
         .default_width(420.0)
@@ -3030,7 +3030,7 @@ fn note_window(ctx: &egui::Context, app: &mut App, st: &mut ModState) {
         ui.horizontal(|ui| {
             for (color, _, label) in super::notes_view::COLORS {
                 let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-                super::common::a11y(&resp, egui::WidgetType::RadioButton, &format!("{label} note"));
+                super::common::a11y(&resp, egui::Role::RadioButton, &format!("{label} note"));
                 ui.painter().rect_filled(r, CornerRadius::same(3), note_fill(color, app.theme.dark));
                 let stroke = if ed.color == color {
                     Stroke::new(2.0, app.theme.accent)

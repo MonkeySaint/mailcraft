@@ -41,6 +41,15 @@ use mailcraft_engine::{Module, Notice, Session};
 use mailcraft_model::{ItemId, ReadingPanePos};
 use serde_json::{Value, json};
 
+/// The test harness every UI test builds on. egui_kittest 0.37 added two checks that are off here, as they
+/// were before: every input widget must have an accessible name (many combo boxes, text fields and spin
+/// buttons have none yet), and a glyph missing from the fonts panics (tests that skip
+/// [`App::install_fonts`] draw ▾, ✕ and arrows that egui's own fonts lack).
+#[cfg(test)]
+pub(crate) fn test_harness<State>() -> egui_kittest::HarnessBuilder<State> {
+    egui_kittest::HarnessBuilder::default().with_accessibility_check(false).allow_missing_glyphs()
+}
+
 /// Which window a ribbon / keyboard handler belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Surface {
@@ -252,7 +261,7 @@ impl ShellLayout {
 }
 
 pub(crate) fn shell_id() -> egui::Id {
-    egui::Id::new("mailcraft_shell_state")
+    egui::Id::unique("mailcraft_shell_state")
 }
 
 /// Reads and updates the shell state of `ctx`.
@@ -506,7 +515,7 @@ impl App {
     pub fn ui(&mut self, ctx: &egui::Context) {
         let mut root = egui::Ui::new(
             ctx.clone(),
-            egui::Id::new("mailcraft_root"),
+            egui::Id::unique("mailcraft_root"),
             egui::UiBuilder::new().layer_id(egui::LayerId::background()).max_rect(ctx.content_rect()),
         );
         self.ui_root(&mut root);
@@ -765,7 +774,7 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_secs_f64((next - now).clamp(0.05, 10.0)));
         let bottom = if self.s.view.status_bar { theme::size::STATUS_BAR } else { 0.0 } + 16.0;
         let theme = self.theme.clone();
-        egui::Area::new(egui::Id::new("mailcraft_toasts"))
+        egui::Area::new(egui::Id::unique("mailcraft_toasts"))
             .order(egui::Order::Tooltip)
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -bottom))
             .interactable(true)

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use egui::{CornerRadius, FontId, Id, Rect, ScrollArea, Sense, Stroke, Ui, WidgetType, pos2, vec2};
+use egui::{CornerRadius, FontId, Id, Rect, Role, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::json;
 
 use mailcraft_engine::cmd::calendar::{
@@ -276,8 +276,8 @@ pub(super) fn table_view(
     for (c, share) in &cols {
         let w = width * share;
         let r = Rect::from_min_size(pos2(x, head.min.y), vec2(w, HEAD_H));
-        let resp = ui.interact(r, Id::new(("mc-cal-table-head", c.name())), Sense::click());
-        a11y(&resp, WidgetType::Button, &format!("Sort by {}", c.label()));
+        let resp = ui.interact(r, Id::unique(("mc-cal-table-head", c.name())), Sense::click());
+        a11y(&resp, Role::Button, &format!("Sort by {}", c.label()));
         if resp.hovered() {
             p.rect_filled(r, CornerRadius::ZERO, app.theme.hover);
         }
@@ -348,11 +348,7 @@ pub(super) fn table_view(
                     let Some(r) = list.get(i) else { continue };
                     let (rect, resp) =
                         ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
-                    a11y(
-                        &resp,
-                        WidgetType::Button,
-                        &format!("{}, {}", r.subject, cell(r, CalendarColumn::Start)),
-                    );
+                    a11y(&resp, Role::Button, &format!("{}, {}", r.subject, cell(r, CalendarColumn::Start)));
                     let selected = app.ui.module_selection == Some(r.id.0);
                     let p = ui.painter();
                     if selected {

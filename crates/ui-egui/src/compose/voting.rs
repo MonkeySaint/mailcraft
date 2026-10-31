@@ -54,11 +54,11 @@ struct Cache {
 struct Answered(Vec<u64>);
 
 fn cache_id() -> egui::Id {
-    egui::Id::new("mailcraft-tracking-cache")
+    egui::Id::unique("mailcraft-tracking-cache")
 }
 
 fn answered_id() -> egui::Id {
-    egui::Id::new("mailcraft-receipt-answered")
+    egui::Id::unique("mailcraft-receipt-answered")
 }
 
 /// Tracking state of `id`, recomputed only when the item or the mailbox changed.

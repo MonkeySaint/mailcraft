@@ -806,9 +806,7 @@ fn colors(ctx: &Context, app: &mut App, d: &Dlg<'_>, target: String) -> Out {
                                 egui::StrokeKind::Inside,
                             );
                         }
-                        resp.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, hex(*c))
-                        });
+                        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, hex(*c)));
                         let resp = resp.on_hover_text(hex(*c));
                         if resp.clicked() {
                             st.rgb = *c;

@@ -720,7 +720,7 @@ fn keytip_for_an_overflowed_control_opens_the_more_menu() {
 
 fn harness(app: App, surface: Surface, width: f32) -> egui_kittest::Harness<'static, App> {
     let frame = crate::responsive::Frame { width, height: 800.0, ..Default::default() };
-    egui_kittest::Harness::builder().with_size(egui::vec2(width, 140.0)).build_ui_state(
+    crate::test_harness().with_size(egui::vec2(width, 140.0)).build_ui_state(
         move |ui, app: &mut App| {
             ribbon(ui, app, surface, &frame);
         },

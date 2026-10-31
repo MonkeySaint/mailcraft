@@ -74,7 +74,7 @@ pub fn widths(c: &ComposeState, width: f32) -> (f32, f32) {
 // Hidden objects (view only)
 
 fn hidden_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-hidden-objects", cid))
+    Id::unique(("mailcraft-compose-hidden-objects", cid))
 }
 
 /// Picture sources hidden from the editor view by the Selection pane.
@@ -214,7 +214,7 @@ fn title_row(ui: &mut Ui, app: &mut App, title: &str) -> bool {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let label = format!("Close {title} pane");
             let r = ui.add(egui::Button::new("\u{2715}").frame(false)).on_hover_text(label.clone());
-            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone()));
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label.clone()));
             close = r.clicked();
         });
     });
@@ -341,7 +341,7 @@ struct StylesState {
 }
 
 fn styles_state_id(cid: u64) -> Id {
-    Id::new(("mc-styles-pane", cid))
+    Id::unique(("mc-styles-pane", cid))
 }
 
 fn styles_pane(ui: &mut Ui, app: &mut App, cid: u64) {
@@ -431,7 +431,7 @@ fn styles_pane(ui: &mut Ui, app: &mut App, cid: u64) {
             ui.horizontal(|ui| {
                 let r =
                     ui.add(egui::TextEdit::singleline(name).hint_text(NEW_STYLE_NAME).desired_width(130.0));
-                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, NEW_STYLE_NAME));
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, NEW_STYLE_NAME));
                 let ok = !name.trim().is_empty();
                 if ui.add_enabled(ok, egui::Button::new("Create")).clicked()
                     || (ok && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -512,7 +512,7 @@ fn apply_styles_window(ctx: &egui::Context, app: &mut App, cid: u64, near: egui:
         .collect();
     let current = mailcraft_engine::cmd::format::current_style(c);
     let styles_open = c.editor.styles_pane;
-    let state_id = Id::new(("mc-apply-styles", cid));
+    let state_id = Id::unique(("mc-apply-styles", cid));
     let mut st: ApplyStylesState = ctx.data(|d| d.get_temp(state_id)).unwrap_or_default();
     if !st.ready {
         st.autocomplete = true;
@@ -534,7 +534,7 @@ fn apply_styles_window(ctx: &egui::Context, app: &mut App, cid: u64, near: egui:
             ui.label(STYLE_NAME_LABEL);
             let r = ui
                 .add(egui::TextEdit::singleline(&mut st.name).desired_width(220.0).id(state_id.with("name")));
-            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, STYLE_NAME_LABEL));
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, STYLE_NAME_LABEL));
             if r.changed() || r.has_focus() {
                 st.editing = true;
             }
@@ -578,7 +578,7 @@ fn apply_styles_window(ctx: &egui::Context, app: &mut App, cid: u64, near: egui:
                 }
                 let styles = ui.add(egui::Button::selectable(styles_open, "Styles"));
                 styles.widget_info(|| {
-                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, styles_open, "Styles pane")
+                    egui::WidgetInfo::selected(egui::Role::Button, true, styles_open, "Styles pane")
                 });
                 if styles.on_hover_text("Show the Styles pane").clicked() {
                     run = Some(("format.stylesPane", json!({"show": !styles_open})));
@@ -619,7 +619,7 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
     // (index, Ctrl held)
     let mut select: Option<(usize, bool)> = None;
     let mut reorder: Option<(usize, i64)> = None;
-    let rename_id = Id::new(("mc-selection-rename", cid));
+    let rename_id = Id::unique(("mc-selection-rename", cid));
     let mut renaming: Option<(usize, String)> = ctx.data(|d| d.get_temp(rename_id));
     let mut run: Option<serde_json::Value> = None;
     let current = objects.iter().position(|o| o.drawing.is_some() && o.drawing == sel_drawing);
@@ -633,7 +633,7 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
         // Reorder: moves the selected drawing one step up (in front) or down (behind) the list.
         let up =
             ui.add_enabled(current.is_some(), egui::Button::new("▲").small()).on_hover_text("Bring Forward");
-        up.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Bring Forward"));
+        up.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Bring Forward"));
         if up.clicked()
             && let Some(i) = current
         {
@@ -641,7 +641,7 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
         }
         let down =
             ui.add_enabled(current.is_some(), egui::Button::new("▼").small()).on_hover_text("Send Backward");
-        down.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Send Backward"));
+        down.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Send Backward"));
         if down.clicked()
             && let Some(i) = current
         {
@@ -670,9 +670,7 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
                     let toggle = if is_hidden { "Show" } else { "Hide" };
                     let label = format!("{toggle} {}", o.name);
                     let t = ui.add(egui::Button::new(toggle).small()).on_hover_text(label.clone());
-                    t.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone())
-                    });
+                    t.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label.clone()));
                     if t.clicked() {
                         if is_hidden {
                             hidden.retain(|h| *h != o.src);
@@ -687,7 +685,7 @@ fn selection_pane(ui: &mut Ui, app: &mut App, cid: u64) {
                     {
                         let r = ui.add(egui::TextEdit::singleline(name).desired_width(140.0));
                         r.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Object name")
+                            egui::WidgetInfo::labeled(egui::Role::TextInput, true, "Object name")
                         });
                         if r.lost_focus() {
                             if !ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
@@ -766,7 +764,7 @@ struct EditorPaneState {
 pub const EDITOR_PANE_PAUSE: f64 = 0.8;
 
 fn editor_state_id(cid: u64) -> Id {
-    Id::new(("mc-editor-pane", cid))
+    Id::unique(("mc-editor-pane", cid))
 }
 
 /// The score line: "Editor score 92%".

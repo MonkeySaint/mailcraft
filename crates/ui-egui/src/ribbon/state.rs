@@ -27,7 +27,7 @@ pub struct Mem {
 }
 
 pub fn mem_id(surface: Surface) -> egui::Id {
-    egui::Id::new(("mailcraft-ribbon-mem", super::surface_key(surface)))
+    egui::Id::unique(("mailcraft-ribbon-mem", super::surface_key(surface)))
 }
 
 pub fn load_mem(ctx: &egui::Context, surface: Surface) -> Mem {

@@ -45,7 +45,7 @@ struct State {
 }
 
 fn id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-mention", cid))
+    Id::unique(("mailcraft-compose-mention", cid))
 }
 
 fn load(ctx: &egui::Context, cid: u64) -> State {
@@ -184,12 +184,12 @@ pub(super) fn popup(
             ui.set_width(LIST_W);
             let (list, _) = ui.allocate_exact_size(vec2(LIST_W, 0.0), Sense::hover());
             ui.interact(list, id(cid).with("label"), Sense::hover())
-                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, LIST_LABEL));
+                .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Unknown, true, LIST_LABEL));
             for (i, (name, addr)) in people.iter().enumerate() {
                 let label =
                     if name.eq_ignore_ascii_case(addr) { addr.clone() } else { format!("{name} <{addr}>") };
                 let (r, resp) = ui.allocate_exact_size(vec2(LIST_W, ROW_H), Sense::click());
-                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
                 if i == st.pick || resp.hovered() {
                     ui.painter().rect_filled(r, 2.0, selected);
                 }

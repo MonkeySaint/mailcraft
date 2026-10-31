@@ -12,7 +12,7 @@ use crate::App;
 type View = fn(&mut egui::Ui, &mut App);
 
 fn harness(view: View, app: App, size: (f32, f32)) -> Harness<'static, App> {
-    let mut h = Harness::builder()
+    let mut h = crate::test_harness()
         .with_size(vec2(size.0, size.1))
         .build_ui_state(move |ui: &mut egui::Ui, app: &mut App| view(ui, app), app);
     h.run_ok();
@@ -316,7 +316,7 @@ fn invitation(a: &mut App) -> u64 {
 fn meeting_bar_accepts_a_request() {
     let mut a = app();
     let mail = invitation(&mut a);
-    let mut h = Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(
+    let mut h = crate::test_harness().with_size(vec2(900.0, 500.0)).build_ui_state(
         move |ui: &mut egui::Ui, app: &mut App| {
             super::meeting_bar(ui, app, mail);
         },
@@ -425,7 +425,7 @@ fn recurring_occurrence_prompt() {
 #[test]
 fn todo_bar_parts_render_and_add_tasks() {
     let a = app();
-    let mut h = Harness::builder()
+    let mut h = crate::test_harness()
         .with_size(vec2(300.0, 900.0))
         .build_ui_state(|ui: &mut egui::Ui, app: &mut App| super::todo_bar(ui, app), a);
     super::set_todo_bar(h.state_mut(), "calendar");
@@ -1018,7 +1018,7 @@ fn task_mail(a: &mut App, from: (&str, &str), ics: &str) -> u64 {
 }
 
 fn bar_harness(a: App, mail: u64) -> Harness<'static, App> {
-    let mut h = Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(
+    let mut h = crate::test_harness().with_size(vec2(900.0, 500.0)).build_ui_state(
         move |ui: &mut egui::Ui, app: &mut App| {
             super::meeting_bar(ui, app, mail);
         },

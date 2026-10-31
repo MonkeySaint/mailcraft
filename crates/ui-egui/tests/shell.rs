@@ -14,16 +14,20 @@ use serde_json::json;
 fn harness(w: f32, h: f32) -> Harness<'static, App> {
     let app = App::new(sample_session());
     let mut fonts_done = false;
-    let mut h = Harness::builder().with_size(egui::vec2(w, h)).build_ui_state(
-        move |ui, app: &mut App| {
-            if !fonts_done {
-                App::install_fonts(ui.ctx());
-                fonts_done = true;
-            }
-            app.ui_root(ui);
-        },
-        app,
-    );
+    let mut h = Harness::builder()
+        .with_accessibility_check(false)
+        .allow_missing_glyphs()
+        .with_size(egui::vec2(w, h))
+        .build_ui_state(
+            move |ui, app: &mut App| {
+                if !fonts_done {
+                    App::install_fonts(ui.ctx());
+                    fonts_done = true;
+                }
+                app.ui_root(ui);
+            },
+            app,
+        );
     h.run_steps(4);
     h
 }
@@ -241,7 +245,7 @@ fn from_refiner_puts_the_caret_between_the_quotes() {
     h.run_steps(4);
     assert!(h.state().ui.search_active);
     assert_eq!(h.state().ui.search_text, "budget from:\"\"");
-    let box_id = egui::Id::new("mailcraft_search_box");
+    let box_id = egui::Id::unique("mailcraft_search_box");
     assert!(h.ctx.memory(|m| m.has_focus(box_id)), "the search box has the keyboard focus");
     let state = egui::TextEdit::load_state(&h.ctx, box_id).expect("search box state");
     let range = state.cursor.char_range().expect("caret");

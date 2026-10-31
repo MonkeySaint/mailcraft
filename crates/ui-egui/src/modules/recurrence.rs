@@ -147,7 +147,7 @@ pub(crate) fn show(ctx: &egui::Context, app: &App, d: &mut RecurrenceDialog, has
     let mut open = true;
     let mut out = Outcome::Keep;
     egui::Window::new("Appointment Recurrence")
-        .id(Id::new(("mc-recurrence", d.nonce)))
+        .id(Id::unique(("mc-recurrence", d.nonce)))
         .collapsible(false)
         .resizable(false)
         .default_width(520.0)

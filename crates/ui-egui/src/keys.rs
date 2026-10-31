@@ -1134,7 +1134,7 @@ fn follow_focus(ctx: &egui::Context) {
 }
 
 fn mem_id() -> egui::Id {
-    egui::Id::new("mailcraft.keys")
+    egui::Id::unique("mailcraft.keys")
 }
 
 fn with_mem<R>(ctx: &egui::Context, f: impl FnOnce(&mut KeyMemory) -> R) -> R {
@@ -2054,7 +2054,7 @@ mod tests {
         let mut app = App::new(sample_session());
         let first = mailcraft_engine::queries::visible_item_ids(&app.s)[0];
         app.run("nav.selectItem", json!({"id": first.0}));
-        let mut h = egui_kittest::Harness::builder()
+        let mut h = crate::test_harness()
             .with_size(egui::vec2(w, h))
             .build_ui_state(|ui, app: &mut App| app.ui_root(ui), app);
         h.run_steps(4);

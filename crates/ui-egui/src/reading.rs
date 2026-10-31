@@ -143,7 +143,7 @@ pub const NEXT_LINK: &str = "Next message";
 
 /// Reading Pane options › "Mark items as read when viewed in the Reading Pane" after the wait in seconds.
 fn mark_read_timer(ctx: &egui::Context, app: &mut App, id: u64) {
-    let key = per_viewport(ctx, Id::new("mailcraft.reading.read-timer"));
+    let key = per_viewport(ctx, Id::unique("mailcraft.reading.read-timer"));
     let st = &app.s.settings;
     let unread = app.s.mailbox.mail.get(ItemId(id)).is_some_and(|m| !m.read);
     if !st.bool("mail.readingPane.markReadWhenViewed") || !unread {
@@ -178,11 +178,11 @@ struct ReadScroll {
 }
 
 fn scroll_id(ctx: &egui::Context) -> Id {
-    per_viewport(ctx, Id::new("mailcraft.reading.scroll-metrics"))
+    per_viewport(ctx, Id::unique("mailcraft.reading.scroll-metrics"))
 }
 
 fn pending_scroll_id(ctx: &egui::Context) -> Id {
-    per_viewport(ctx, Id::new("mailcraft.reading.scroll-to"))
+    per_viewport(ctx, Id::unique("mailcraft.reading.scroll-to"))
 }
 
 /// `base` for the window being drawn: the main window keeps `base`, each explorer window (a second main
@@ -208,13 +208,13 @@ pub(crate) fn forget_viewport(ctx: &egui::Context, vp: egui::ViewportId) {
     }
     let salt = |base: Id| salted(base, vp);
     ctx.data_mut(|d| {
-        d.remove::<MsgCache>(salt(Id::new(("mailcraft.reading.cache", Surface::Main))));
-        d.remove::<FindBar>(salt(Id::new(("mailcraft.reading.find", Surface::Main))));
-        d.remove::<(u64, Request)>(salt(Id::new(("mailcraft.reading.request", Surface::Main))));
-        d.remove::<ReadScroll>(salt(Id::new("mailcraft.reading.scroll-metrics")));
-        d.remove::<f32>(salt(Id::new("mailcraft.reading.scroll-to")));
-        d.remove::<(u64, f64)>(salt(Id::new("mailcraft.reading.read-timer")));
-        d.remove::<[egui::Rect; 3]>(salt(egui::Id::new(("mailcraft.reading.stops", Surface::Main.key()))));
+        d.remove::<MsgCache>(salt(Id::unique(("mailcraft.reading.cache", Surface::Main))));
+        d.remove::<FindBar>(salt(Id::unique(("mailcraft.reading.find", Surface::Main))));
+        d.remove::<(u64, Request)>(salt(Id::unique(("mailcraft.reading.request", Surface::Main))));
+        d.remove::<ReadScroll>(salt(Id::unique("mailcraft.reading.scroll-metrics")));
+        d.remove::<f32>(salt(Id::unique("mailcraft.reading.scroll-to")));
+        d.remove::<(u64, f64)>(salt(Id::unique("mailcraft.reading.read-timer")));
+        d.remove::<[egui::Rect; 3]>(salt(egui::Id::unique(("mailcraft.reading.stops", Surface::Main.key()))));
     });
 }
 
@@ -365,12 +365,12 @@ pub(crate) fn read_viewport_id(item: u64) -> egui::ViewportId {
 }
 
 fn neighbour_id(item: u64) -> Id {
-    Id::new(("mailcraft.read-window.neighbours", item))
+    Id::unique(("mailcraft.read-window.neighbours", item))
 }
 
 /// Folder a read window's item was in when the window opened on it.
 fn folder_id(item: u64) -> Id {
-    Id::new(("mailcraft.read-window.folder", item))
+    Id::unique(("mailcraft.read-window.folder", item))
 }
 
 /// "<subject> - Message (HTML)".
@@ -432,7 +432,7 @@ struct Toggles {
 }
 
 fn toggles_id() -> Id {
-    Id::new("mailcraft.reading.toggles")
+    Id::unique("mailcraft.reading.toggles")
 }
 
 fn toggles(ctx: &egui::Context) -> Toggles {
@@ -455,7 +455,7 @@ struct MsgCache {
 }
 
 fn cache_id(ctx: &egui::Context, surface: Surface) -> Id {
-    surface_id(ctx, Id::new(("mailcraft.reading.cache", surface)), surface)
+    surface_id(ctx, Id::unique(("mailcraft.reading.cache", surface)), surface)
 }
 
 /// Layout key of the doc built for source key `sk`.
@@ -467,7 +467,7 @@ fn doc_key(sk: u64) -> u64 {
 /// remote pictures, when the pane has one for that same content.
 fn shared_pane_doc(ctx: &egui::Context, item: u64, sk: u64) -> Option<(Arc<Doc>, bool)> {
     // The main window's cache, whichever window is being drawn (`cache_id` salts it for other viewports).
-    let key = Id::new(("mailcraft.reading.cache", Surface::Main));
+    let key = Id::unique(("mailcraft.reading.cache", Surface::Main));
     // Taken out and put back: a copy would clone the pane's whole layout.
     let pane = ctx.data_mut(|d| d.remove_temp::<MsgCache>(key))?;
     let shared =
@@ -546,15 +546,15 @@ pub const FIND_CLOSE: &str = "Close find";
 pub const NO_MATCHES: &str = "No results";
 
 fn request_id(ctx: &egui::Context, surface: Surface) -> Id {
-    surface_id(ctx, Id::new(("mailcraft.reading.request", surface)), surface)
+    surface_id(ctx, Id::unique(("mailcraft.reading.request", surface)), surface)
 }
 
 fn find_id(ctx: &egui::Context, surface: Surface) -> Id {
-    surface_id(ctx, Id::new(("mailcraft.reading.find", surface)), surface)
+    surface_id(ctx, Id::unique(("mailcraft.reading.find", surface)), surface)
 }
 
 fn find_field_id(ctx: &egui::Context, surface: Surface) -> Id {
-    surface_id(ctx, Id::new(("mailcraft.reading.find-field", surface)), surface)
+    surface_id(ctx, Id::unique(("mailcraft.reading.find-field", surface)), surface)
 }
 
 /// Hands a Find / Select request for message `item` to the view showing it: its read window when one is
@@ -567,7 +567,7 @@ pub fn request(ctx: &egui::Context, app: &App, item: u64, r: Request) {
         for w in &app.ui.explorers {
             if w.selection.focus == Some(ItemId(item)) || w.selection.items.contains(&ItemId(item)) {
                 let id = salted(
-                    Id::new(("mailcraft.reading.request", Surface::Main)),
+                    Id::unique(("mailcraft.reading.request", Surface::Main)),
                     crate::explorer::viewport_id(w.id),
                 );
                 ctx.data_mut(|d| d.insert_temp(id, (item, r.clone())));
@@ -713,7 +713,7 @@ fn find_bar(ui: &mut Ui, app: &App, surface: Surface, bar: &mut FindBar) {
                         .desired_width(field_w),
                 );
                 let r = r.on_hover_text(FIND_LABEL);
-                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, FIND_LABEL));
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, FIND_LABEL));
                 if std::mem::take(&mut bar.focus) {
                     r.request_focus();
                 }
@@ -738,7 +738,7 @@ fn find_bar(ui: &mut Ui, app: &App, surface: Surface, bar: &mut FindBar) {
                 }
                 ui.checkbox(&mut bar.match_case, "Match case");
                 let x = ui.button("\u{2715}").on_hover_text(FIND_CLOSE);
-                x.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, FIND_CLOSE));
+                x.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, FIND_CLOSE));
                 if x.clicked() {
                     close = true;
                 }
@@ -985,7 +985,7 @@ fn message_view(ui: &mut Ui, app: &mut App, id: u64, surface: Surface, narrow: b
     if surface == Surface::Main {
         let m = ReadScroll {
             item: id,
-            offset: shown.state.offset.y,
+            offset: shown.state.clamped_offset().y,
             content: shown.content_size.y,
             view: shown.inner_rect.height(),
         };
@@ -1064,7 +1064,7 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
             {
                 let r =
                     ui.add_enabled(on, egui::Link::new(RichText::new(label).size(12.0).color(theme.link)));
-                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, on, name));
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, on, name));
                 if r.clicked() {
                     step = Some(next);
                 }
@@ -1160,7 +1160,7 @@ fn header(ui: &mut Ui, app: &mut App, h: &ReadingHeader, id: u64, narrow: bool, 
 }
 
 fn stops_id(ctx: &egui::Context, surface: Surface) -> egui::Id {
-    surface_id(ctx, egui::Id::new(("mailcraft.reading.stops", surface.key())), surface)
+    surface_id(ctx, egui::Id::unique(("mailcraft.reading.stops", surface.key())), surface)
 }
 
 /// Where the message view of `surface` drew its header, info bars and body in the last frame (visible
@@ -1318,7 +1318,7 @@ fn attachment_chip(ui: &mut Ui, app: &mut App, id: u64, index: usize, name: &str
         });
     inner
         .response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, format!("{name} {size}")));
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Unknown, true, format!("{name} {size}")));
     if let Some((cmd, p)) = action {
         app.run(cmd, p);
     }
@@ -1481,7 +1481,7 @@ fn plain_icon_button(
         ui.painter().galley(pos, g, theme.text);
     }
     let name = label.unwrap_or(tooltip).to_owned();
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name.clone()));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name.clone()));
     if label.is_none() || label != Some(tooltip) { resp.on_hover_text(tooltip.to_owned()) } else { resp }
 }
 
@@ -1505,7 +1505,7 @@ fn sun_button(ui: &mut Ui, app: &mut App, on: bool, tooltip: &str) -> egui::Resp
         ui.painter().line_segment([c + d * 6.0, c + d * 8.5], Stroke::new(1.3, ink));
     }
     let name = tooltip.to_owned();
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, name.clone()));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, on, name.clone()));
     resp.on_hover_text(tooltip.to_owned())
 }
 
@@ -1527,7 +1527,7 @@ fn open_link(ctx: &egui::Context, app: &mut App, href: &str) {
 }
 
 fn link_prompt_id() -> Id {
-    Id::new("mailcraft.reading.link-prompt")
+    Id::unique("mailcraft.reading.link-prompt")
 }
 
 /// The "open this link?" prompt of Trust Center › "Ask before opening web links in messages".
@@ -1709,7 +1709,7 @@ mod tests {
     }
 
     fn harness(app: App) -> Harness<'static, App> {
-        Harness::builder().with_size(Vec2::new(900.0, 700.0)).build_ui_state(
+        crate::test_harness().with_size(Vec2::new(900.0, 700.0)).build_ui_state(
             |ui, app: &mut App| {
                 let frame = Frame { width: 1400.0, height: 900.0, ..Frame::default() };
                 reading_pane(ui, app, &frame);
@@ -1945,7 +1945,7 @@ mod tests {
         let ctx = egui::Context::default();
         let explorer = crate::explorer::viewport_id(1);
         let frame = Frame { width: 1400.0, height: 900.0, ..Frame::default() };
-        let base = Id::new(("mailcraft.reading.cache", Surface::Main));
+        let base = Id::unique(("mailcraft.reading.cache", Surface::Main));
         let draw = |app: &mut App, vp: egui::ViewportId, item: ItemId| {
             app.s.selection.items = vec![item];
             app.s.selection.focus = Some(item);
@@ -2025,7 +2025,7 @@ mod tests {
     fn read_window_find_runs_end_to_end() {
         let (mut app, id) = app_with_text("pear and pear");
         app.ui.read_windows.push(id);
-        let mut h = Harness::builder().with_size(Vec2::new(1200.0, 900.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1200.0, 900.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 app.ui_root(ui);
@@ -2184,7 +2184,7 @@ mod tests {
         let ribbon_shown = |w: f32, h: f32| {
             let mut app = App::new(sample_session());
             app.ui.read_windows.push(id.0);
-            let mut hn = Harness::builder().with_size(Vec2::new(w, h)).build_ui_state(
+            let mut hn = crate::test_harness().with_size(Vec2::new(w, h)).build_ui_state(
                 move |ui, app: &mut App| {
                     read_window_ui(ui, app, id.0, egui::ViewportClass::Immediate);
                 },
@@ -2210,7 +2210,7 @@ mod tests {
             s.mailbox.mail.items().find(|m| s.body_or_empty(m).html.is_some()).unwrap().subject.clone();
         let app = app_with(&subject);
         let id = app.s.selection.focus.unwrap().0;
-        let mut h = Harness::builder().with_size(Vec2::new(1200.0, 800.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1200.0, 800.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 let frame = Frame { width: 1400.0, height: 900.0, ..Frame::default() };
@@ -2222,7 +2222,7 @@ mod tests {
         );
         h.run();
         let cached = |h: &Harness<'_, App>, surface: Surface| {
-            h.ctx.data(|d| d.get_temp::<MsgCache>(Id::new(("mailcraft.reading.cache", surface)))).unwrap()
+            h.ctx.data(|d| d.get_temp::<MsgCache>(Id::unique(("mailcraft.reading.cache", surface)))).unwrap()
         };
         let pane = cached(&h, Surface::Main);
         assert_eq!(pane.item, id);
@@ -2289,7 +2289,7 @@ mod tests {
         let id = s.mailbox.mail.ids().next().unwrap();
         let mut app = App::new(s);
         app.ui.read_windows.push(id.0);
-        let mut h = Harness::builder().with_size(Vec2::new(1000.0, 800.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1000.0, 800.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 let ctx = ui.ctx().clone();
@@ -2312,7 +2312,7 @@ mod tests {
         let id = s.mailbox.mail.items().find(|m| m.subject == "Slides for Thursday").map(|m| m.id.0).unwrap();
         let mut app = App::new(s);
         app.ui.read_windows.push(id);
-        let mut h = Harness::builder().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 let ctx = ui.ctx().clone();
@@ -2368,7 +2368,7 @@ mod tests {
         let id = s.mailbox.mail.ids().next().unwrap();
         let mut app = App::new(s);
         app.ui.read_windows.push(id.0);
-        let mut h = Harness::builder().with_size(Vec2::new(1920.0, 1080.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1920.0, 1080.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 let ctx = ui.ctx().clone();
@@ -2407,7 +2407,7 @@ mod tests {
         let id = s.mailbox.items_in(s.selection.folder).first().map(|m| m.id.0).unwrap();
         let mut app = App::new(s);
         app.ui.read_windows.push(id);
-        let mut h = Harness::builder().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 let ctx = ui.ctx().clone();
@@ -2455,7 +2455,7 @@ mod tests {
         let mut app = App::new(s);
         app.run("mail.reply", json!({"ids": [id], "window": true})).unwrap();
         let cid = app.s.composes.values().find(|c| !c.inline).map(|c| c.id).unwrap();
-        let mut h = Harness::builder().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 let ctx = ui.ctx().clone();
@@ -2484,7 +2484,7 @@ mod tests {
         let ids: Vec<u64> = s.mailbox.items_in(s.selection.folder).iter().take(2).map(|m| m.id.0).collect();
         let mut app = App::new(s);
         app.ui.read_windows.extend(ids.iter().copied());
-        let mut h = Harness::builder().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1024.0, 768.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 let ctx = ui.ctx().clone();
@@ -2512,7 +2512,7 @@ mod tests {
     }
 
     fn embedded_read_windows(app: App) -> Harness<'static, App> {
-        Harness::builder().with_size(Vec2::new(1000.0, 800.0)).build_ui_state(
+        crate::test_harness().with_size(Vec2::new(1000.0, 800.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 let ctx = ui.ctx().clone();
@@ -2695,7 +2695,7 @@ mod tests {
         let id = s.mailbox.items_in(s.selection.folder).first().map(|m| m.id).unwrap();
         let mut app = App::new(s);
         crate::edit_message::start(&mut app, id.0);
-        let mut h = Harness::builder()
+        let mut h = crate::test_harness()
             .with_size(Vec2::new(1400.0, 900.0))
             .build_ui_state(|ui, app: &mut App| app.ui_root(ui), app);
         h.run_steps(3);
@@ -2754,7 +2754,7 @@ mod tests {
         s.run("mail.flag", &json!({"ids": [id.0]})).unwrap();
         let mut app = App::new(s);
         app.ui.read_windows.push(id.0);
-        let mut h = Harness::builder().with_size(Vec2::new(1100.0, 900.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1100.0, 900.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 let ctx = ui.ctx().clone();
@@ -2814,7 +2814,7 @@ mod tests {
     }
 
     fn sized(app: App, w: f32) -> Harness<'static, App> {
-        Harness::builder().with_size(Vec2::new(w, 600.0)).build_ui_state(
+        crate::test_harness().with_size(Vec2::new(w, 600.0)).build_ui_state(
             |ui, app: &mut App| {
                 let frame = Frame { width: 1400.0, height: 900.0, ..Frame::default() };
                 reading_pane(ui, app, &frame);

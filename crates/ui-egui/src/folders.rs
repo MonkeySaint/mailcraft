@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use egui::epaint::TextShape;
-use egui::{Id, Rect, Sense, Stroke, Ui, UiBuilder, WidgetInfo, WidgetType, pos2, vec2};
+use egui::{Id, Rect, Role, Sense, Stroke, Ui, UiBuilder, WidgetInfo, pos2, vec2};
 use mailcraft_engine::Module;
 use mailcraft_engine::queries::{self, FolderRow, FolderRowKind};
 use mailcraft_model::{FolderId, FolderKind, FolderPaneState, FolderRole};
@@ -33,7 +33,7 @@ struct PaneState {
 }
 
 fn state_id() -> Id {
-    Id::new("mailcraft.folders.state")
+    Id::unique("mailcraft.folders.state")
 }
 
 fn run(ui: &Ui, app: &mut App, id: &str, params: Value) {
@@ -149,12 +149,12 @@ fn full_pane(ui: &mut Ui, app: &mut App, rect: Rect, st: &mut PaneState) {
     // « collapse button, top-right (on top of the first row).
     let th = app.theme.clone();
     let b = Rect::from_min_size(pos2(rect.right() - 19.0 - 6.0, rect.top() + 7.5), vec2(19.0, 19.0));
-    let resp = ui.interact(b, Id::new("mailcraft.folders.minimize"), Sense::click());
+    let resp = ui.interact(b, Id::unique("mailcraft.folders.minimize"), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(b, 3.0, th.hover);
     }
     app.icons.paint(ui, icon_rect(b.center(), 14.0), "chevron-left", th.text_muted);
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Minimize the Folder Pane"));
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Minimize the Folder Pane"));
     if resp.on_hover_text("Minimize the Folder Pane").clicked() {
         run(ui, app, "view.folderPane", json!({ "mode": "minimized" }));
     }
@@ -239,7 +239,7 @@ fn section_row(ui: &mut Ui, app: &mut App, row: &FolderRow, collapsed: bool) -> 
     let w = ui.available_width();
     let (_, rect) = ui.allocate_space(vec2(w, size::ACCOUNT_ROW));
     let key = section_key(row);
-    let resp = ui.interact(rect, Id::new(("mailcraft.folders.section", &key)), Sense::click());
+    let resp = ui.interact(rect, Id::unique(("mailcraft.folders.section", &key)), Sense::click());
     let painter = ui.painter().clone();
     if resp.hovered() {
         painter.rect_filled(rect, 3.0, th.hover);
@@ -251,9 +251,7 @@ fn section_row(ui: &mut Ui, app: &mut App, row: &FolderRow, collapsed: bool) -> 
     let t = Text::new(ui, &row.name, font, bold, th.text, (rect.width() - 56.0).max(1.0), 1);
     t.paint_left(&painter, rect, rect.left() + 24.0);
     let state = if collapsed { "collapsed" } else { "expanded" };
-    resp.widget_info(|| {
-        WidgetInfo::labeled(WidgetType::CollapsingHeader, true, format!("{}, {state}", row.accessible))
-    });
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("{}, {state}", row.accessible)));
     let toggled = resp.clicked();
     if row.kind == FolderRowKind::AccountRoot
         && let Some(account) = account_of(app, &row.name)
@@ -266,7 +264,7 @@ fn section_row(ui: &mut Ui, app: &mut App, row: &FolderRow, collapsed: bool) -> 
 /// Widget id (keyboard focus target) of a folder's row in the folder pane: its Favorites row when `favorite`,
 /// else its row in the account tree. A folder listed in both has one row of each.
 pub fn row_focus_id(folder: FolderId, favorite: bool) -> Id {
-    Id::new(("mailcraft.folders.row", if favorite { "fav" } else { "tree" }, folder.0))
+    Id::unique(("mailcraft.folders.row", if favorite { "fav" } else { "tree" }, folder.0))
 }
 
 /// One folder (or favourite) row; `highlight` = drawn as the selected row. Returns true when it was clicked
@@ -332,7 +330,7 @@ fn folder_row(ui: &mut Ui, app: &mut App, row: &FolderRow, highlight: bool) -> b
     }
 
     let mut navigated = false;
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, highlight, &row.accessible));
+    resp.widget_info(|| WidgetInfo::selected(Role::Button, true, highlight, &row.accessible));
     if resp.clicked() {
         if !row.selected {
             run(ui, app, "nav.selectFolder", json!({ "folder": fid.0 }));
@@ -353,9 +351,9 @@ fn folder_row(ui: &mut Ui, app: &mut App, row: &FolderRow, highlight: bool) -> b
         let chevron = if row.expanded { "chevron-down" } else { "chevron-right" };
         app.icons.paint(ui, icon_rect(chevron_rect.center(), 12.0), chevron, th.text_muted);
         let cresp =
-            ui.interact(chevron_rect, Id::new(("mailcraft.folders.chevron", tag, fid.0)), Sense::click());
+            ui.interact(chevron_rect, Id::unique(("mailcraft.folders.chevron", tag, fid.0)), Sense::click());
         let label = if row.expanded { "Collapse" } else { "Expand" };
-        cresp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{label} {}", row.name)));
+        cresp.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("{label} {}", row.name)));
         if cresp.clicked() {
             let cmd = if row.expanded { "folder.collapse" } else { "folder.expand" };
             run(ui, app, cmd, json!({ "folder": fid.0 }));
@@ -371,9 +369,9 @@ fn folder_row(ui: &mut Ui, app: &mut App, row: &FolderRow, highlight: bool) -> b
 /// The name box of a folder renamed in place: Enter (or leaving the box) renames, Escape keeps the name.
 fn inline_rename(ui: &mut Ui, app: &mut App, fid: FolderId, rect: Rect) {
     let Some(mut r) = app.ui.inline_rename.take() else { return };
-    let id = Id::new(("mailcraft.folders.rename", fid.0));
+    let id = Id::unique(("mailcraft.folders.rename", fid.0));
     let resp = ui.put(rect, egui::TextEdit::singleline(&mut r.text).id(id).desired_width(rect.width()));
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Folder name"));
+    resp.widget_info(|| WidgetInfo::labeled(Role::TextInput, true, "Folder name"));
     if !r.focused {
         resp.request_focus();
         r.focused = true;
@@ -406,12 +404,12 @@ fn minimized_strip(ui: &mut Ui, app: &mut App, rect: Rect, auto: bool, st: &mut 
     let strip = rect;
     let painter = ui.painter_at(strip);
     let b = Rect::from_min_size(pos2(strip.center().x - 9.5, strip.top() + 7.5), vec2(19.0, 19.0));
-    let resp = ui.interact(b, Id::new("mailcraft.folders.expand"), Sense::click());
+    let resp = ui.interact(b, Id::unique("mailcraft.folders.expand"), Sense::click());
     if resp.hovered() || st.flyout {
         painter.rect_filled(b, 3.0, th.hover);
     }
     app.icons.paint(ui, icon_rect(b.center(), 14.0), "chevron-right", th.text_muted);
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Expand the Folder Pane"));
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Expand the Folder Pane"));
     let expand_clicked = resp.on_hover_text("Expand the Folder Pane").clicked();
     if expand_clicked {
         if auto {
@@ -447,7 +445,7 @@ fn minimized_strip(ui: &mut Ui, app: &mut App, rect: Rect, auto: bool, st: &mut 
         let t = Text::new(ui, &label, 13.0, false, th.text, max_len, 1);
         let len = t.width();
         let item = Rect::from_min_size(pos2(strip.left(), y - 6.0), vec2(strip.width(), len + 12.0));
-        let iresp = ui.interact(item, Id::new(("mailcraft.folders.vertical", fid.0)), Sense::click());
+        let iresp = ui.interact(item, Id::unique(("mailcraft.folders.vertical", fid.0)), Sense::click());
         let drop_hover = accepts_mail(app, fid) && iresp.dnd_hover_payload::<DraggedItems>().is_some();
         if drop_hover {
             painter.rect_filled(item.shrink2(vec2(2.0, 0.0)), 3.0, th.selected);
@@ -460,7 +458,7 @@ fn minimized_strip(ui: &mut Ui, app: &mut App, rect: Rect, auto: bool, st: &mut 
         // height extends to the left, so the pivot sits half a line right of the strip's centre.
         let pos = pos2(strip.center().x + t.height() / 2.0, y);
         painter.add(TextShape::new(pos, t.galley.clone(), th.text).with_angle(std::f32::consts::FRAC_PI_2));
-        iresp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, &accessible));
+        iresp.widget_info(|| WidgetInfo::selected(Role::Button, true, selected, &accessible));
         if iresp.clicked() && !selected {
             run(ui, app, "nav.selectFolder", json!({ "folder": fid.0 }));
         }
@@ -476,7 +474,7 @@ fn minimized_strip(ui: &mut Ui, app: &mut App, rect: Rect, auto: bool, st: &mut 
     // Flyout: the full tree over the content while the window is too narrow for the pane.
     if auto && st.flyout {
         let pos = pos2(strip.right() + 2.0, strip.top());
-        let area = egui::Area::new(Id::new("mailcraft.folders.flyout"))
+        let area = egui::Area::new(Id::unique("mailcraft.folders.flyout"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .show(ui.ctx(), |ui| {
@@ -512,7 +510,7 @@ mod tests {
     use mailcraft_engine::sample::{SAMPLE_USER_ADDR, sample_session};
 
     fn harness(app: App, size: egui::Vec2) -> Harness<'static, App> {
-        Harness::builder().with_size(size).build_ui_state(
+        crate::test_harness().with_size(size).build_ui_state(
             |ui, app: &mut App| {
                 let frame = Frame::compute(1600.0, 900.0);
                 folder_pane(ui, app, &frame);
@@ -638,7 +636,7 @@ mod tests {
 
     #[test]
     fn auto_minimised_flyout() {
-        let mut h = Harness::builder().with_size(vec2(600.0, 900.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(vec2(600.0, 900.0)).build_ui_state(
             |ui, app: &mut App| {
                 let frame = Frame::compute(700.0, 900.0);
                 ui.allocate_ui(vec2(size::FOLDER_PANE_MIN, 880.0), |ui| folder_pane(ui, app, &frame));
@@ -664,7 +662,7 @@ mod tests {
     fn reading_view_shows_the_strip_and_keeps_the_setting() {
         let mut s = sample_session();
         s.run("view.readingView", &json!({})).unwrap();
-        let mut h = Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(vec2(1200.0, 900.0)).build_ui_state(
             |ui, app: &mut App| {
                 let frame = Frame::compute(1600.0, 900.0);
                 ui.allocate_ui(vec2(size::FOLDER_PANE_MIN, 880.0), |ui| folder_pane(ui, app, &frame));
@@ -695,7 +693,7 @@ mod tests {
         let inbox = s.selection.folder;
         let deleted = s.mailbox.role_folder(s.current_account().unwrap(), FolderRole::DeletedItems).unwrap();
         let id = s.mailbox.items_in(inbox).first().unwrap().id.0;
-        let mut h = Harness::new_ui_state(
+        let mut h = crate::test_harness().build_ui_state(
             |ui, app: &mut App| {
                 drop_items(ui, app, &[id], deleted);
                 drop_items(ui, app, &[id], deleted);

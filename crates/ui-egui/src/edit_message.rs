@@ -135,7 +135,7 @@ impl EditorHost for MsgEditor {
 type Shared = Arc<Mutex<MsgEditor>>;
 
 fn state_id(item: u64) -> Id {
-    Id::new(("mailcraft.edit-message", item))
+    Id::unique(("mailcraft.edit-message", item))
 }
 
 fn shared(ctx: &egui::Context, item: u64) -> Option<Shared> {
@@ -397,7 +397,6 @@ impl EditorHostBar for MsgEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
     use mailcraft_engine::sample::sample_session;
 
@@ -487,7 +486,7 @@ mod tests {
         let mut app = App::new(sample_session());
         let id = html_item(&app);
         start(&mut app, id);
-        let mut h = Harness::builder().with_size(egui::vec2(900.0, 700.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(egui::vec2(900.0, 700.0)).build_ui_state(
             move |ui, app: &mut App| {
                 let o = editor_ui(ui, app, id);
                 if o.close {

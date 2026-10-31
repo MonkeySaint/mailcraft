@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use egui::{Color32, Galley, Rect, Response, Sense, Ui, WidgetInfo, WidgetType, vec2};
+use egui::{Color32, Galley, Rect, Response, Role, Sense, Ui, WidgetInfo, vec2};
 
 use crate::App;
 
@@ -92,9 +92,9 @@ fn flat(
     let info_label = label.to_owned();
     resp.widget_info(|| {
         if on {
-            WidgetInfo::selected(WidgetType::Button, enabled, true, info_label.clone())
+            WidgetInfo::selected(Role::Button, enabled, true, info_label.clone())
         } else {
-            WidgetInfo::labeled(WidgetType::Button, enabled, info_label.clone())
+            WidgetInfo::labeled(Role::Button, enabled, info_label.clone())
         }
     });
     if ui.is_rect_visible(rect) {
@@ -160,7 +160,7 @@ pub fn big_button(ui: &mut Ui, app: &mut App, icon: &str, label: &str, enabled: 
     let h = 4.0 + BIG_ICON + 4.0 + th.max(14.0) + 4.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), sense(enabled));
     let info_label = label.to_owned();
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, info_label.clone()));
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, info_label.clone()));
     if ui.is_rect_visible(rect) {
         paint_flat_bg(ui, rect, &resp, false, enabled);
         paint_icon(
@@ -185,7 +185,7 @@ pub fn icon_only(ui: &mut Ui, app: &mut App, icon: &str, tooltip: &str, enabled:
     let side = ui.spacing().interact_size.y.max(24.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(side + 4.0, side), sense(enabled));
     let info_label = tooltip.to_owned();
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, info_label.clone()));
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, info_label.clone()));
     if ui.is_rect_visible(rect) {
         paint_flat_bg(ui, rect, &resp, false, enabled);
         paint_icon(ui, app, rect.center(), ICON, icon, color);
@@ -208,7 +208,7 @@ pub fn icon_toggle(ui: &mut Ui, app: &mut App, icon: &str, tooltip: &str, on: bo
     let color = fg(ui, true);
     let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click());
     let info_label = tooltip.to_owned();
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, on, info_label.clone()));
+    resp.widget_info(|| WidgetInfo::selected(Role::Button, true, on, info_label.clone()));
     if ui.is_rect_visible(rect) {
         paint_flat_bg(ui, rect, &resp, on, true);
         let icon_size = (side * 0.6).clamp(ICON - 4.0, 20.0);
@@ -240,12 +240,12 @@ pub fn item_windows_open(app: &App) -> usize {
 
 /// The layer of an embedded item window that covers the screen ([`item_window`]).
 pub fn item_cover_layer(id: egui::ViewportId) -> egui::LayerId {
-    egui::LayerId::new(egui::Order::Background, egui::Id::new(("mc-item-cover", id)))
+    egui::LayerId::new(egui::Order::Background, egui::Id::unique(("mc-item-cover", id)))
 }
 
 /// The layer of an embedded item window drawn as a floating window ([`item_window`]).
 pub fn item_float_layer(id: egui::ViewportId) -> egui::LayerId {
-    egui::LayerId::new(egui::Order::Middle, egui::Id::new(id))
+    egui::LayerId::new(egui::Order::Middle, egui::Id::unique(id))
 }
 
 /// Brings item window `id` to the front: its OS window where it has one, else its embedded layer (an
@@ -318,8 +318,8 @@ pub fn item_window<T: Default>(
     let shown = |layer: egui::LayerId| ctx.memory(|m| m.areas().visible_last_frame(&layer));
     let was_float = shown(float);
     let was_cover = shown(item_cover_layer(id));
-    let newest_key = egui::Id::new("mc-item-window-newest");
-    let raise_key = egui::Id::new("mc-item-window-raise-newest");
+    let newest_key = egui::Id::unique("mc-item-window-newest");
+    let raise_key = egui::Id::unique("mc-item-window-raise-newest");
     if !was_float && !was_cover {
         // Just opened: it comes to the front, above a window that starts floating in the same frame.
         ctx.data_mut(|d| d.insert_temp(newest_key, id));
@@ -373,7 +373,7 @@ pub fn item_window<T: Default>(
             ui.set_min_size(screen.size());
             ui.set_max_size(screen.size());
             // Swallow clicks on the strip and any gaps so nothing below reacts.
-            let _ = ui.interact(screen, egui::Id::new(("mc-item-window-blocker", id)), Sense::click());
+            let _ = ui.interact(screen, egui::Id::unique(("mc-item-window-blocker", id)), Sense::click());
             ui.painter().rect_filled(screen, 0.0, theme.pane);
             let strip = Rect::from_min_size(screen.min, vec2(screen.width(), EMBED_TITLE_H));
             ui.painter().rect_filled(strip, 0.0, theme.ribbon);

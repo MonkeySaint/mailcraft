@@ -104,8 +104,8 @@ struct PrefSync {
 /// settings (`state.uiPrefs`) at start-up, mirrors every engine option in as `options.<key>` (read-only copies
 /// for code that still reads dialog prefs) and saves dialog settings that changed.
 pub(crate) fn sync_ui_prefs(ctx: &egui::Context, app: &mut App) {
-    let sync_id = egui::Id::new("mc-ui-prefs-sync");
-    let prefs_id = egui::Id::new(UI_PREFS_ID);
+    let sync_id = egui::Id::unique("mc-ui-prefs-sync");
+    let prefs_id = egui::Id::unique(UI_PREFS_ID);
     let mut sync = ctx.data_mut(|d| d.get_temp::<PrefSync>(sync_id)).unwrap_or_default();
     let mut p = ctx.data_mut(|d| d.get_temp::<UiPrefs>(prefs_id)).unwrap_or_default();
     let mut touched = false;
@@ -171,7 +171,7 @@ struct DisplayApplied {
 }
 
 fn display_id() -> egui::Id {
-    egui::Id::new("mc-display-settings")
+    egui::Id::unique("mc-display-settings")
 }
 
 /// General › Theme "Use system setting" (follows the system's light/dark preference) and Advanced › "Use
@@ -229,7 +229,7 @@ pub struct Bands {
 }
 
 fn bands_id() -> egui::Id {
-    egui::Id::new("mailcraft.chrome.bands")
+    egui::Id::unique("mailcraft.chrome.bands")
 }
 
 /// The status bar and ribbon rectangles of the main window's last frame.
@@ -548,9 +548,9 @@ fn account_button(ui: &mut Ui, app: &mut App, rect: Rect) {
         .unwrap_or_default();
     let initials = mailcraft_engine::queries::initials(Some(name.as_str()), &addr);
     let label = if addr.is_empty() { "Account".to_owned() } else { format!("Account: {addr}") };
-    let resp = ui.interact(rect, ui.id().with("mc_account"), Sense::click());
+    let resp = ui.interact(rect, ui.scope_id().with("mc_account"), Sense::click());
     let info = label.clone();
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, info.clone()));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, info.clone()));
     let theme = &app.theme;
     if resp.hovered() {
         ui.painter().rect_filled(rect, CornerRadius::ZERO, theme.chrome_text.gamma_multiply(0.14));
@@ -620,7 +620,7 @@ fn scope_shortcut(scope: SearchScope) -> &'static str {
 /// Recent Searches under the focused, empty search box: shown on focus, closed by a pick, typing, Escape or
 /// a click elsewhere. A pick runs `search.recent` (which also moves it to the top of the list).
 fn recent_searches_popup(ctx: &egui::Context, app: &mut App, edit: &egui::Response, rect: Rect) {
-    let id = egui::Id::new("mailcraft_search_recent");
+    let id = egui::Id::unique("mailcraft_search_recent");
     let mut open = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
     if edit.gained_focus() && app.ui.search_text.is_empty() && !app.s.search.recent.is_empty() {
         open = true;
@@ -709,7 +709,7 @@ fn search_box(ui: &mut Ui, app: &mut App, _frame: &Frame, bar: Rect, qat_end: f3
         return;
     }
     let rect = Rect::from_center_size(pos2(x + w / 2.0, bar.center().y), vec2(w, size::SEARCH_H));
-    let edit_id = egui::Id::new("mailcraft_search_box");
+    let edit_id = egui::Id::unique("mailcraft_search_box");
     let focused = ctx.memory(|m| m.has_focus(edit_id));
 
     // Pick up queries set by commands (refine, recent searches) while the box is not being edited.
@@ -757,7 +757,7 @@ fn search_box(ui: &mut Ui, app: &mut App, _frame: &Frame, bar: Rect, qat_end: f3
             .frame(egui::Frame::NONE)
             .text_color(fg)
             .desired_width(edit_w)
-            .vertical_align(Align::Center),
+            .align(egui::Align2::LEFT_CENTER),
     );
     let focus_requested = with_shell(&ctx, |st| std::mem::take(&mut st.focus_search));
     if focus_requested {
@@ -914,7 +914,7 @@ pub fn tab_row(ui: &mut Ui, app: &mut App, frame: &Frame) {
         ui.add_space(6.0);
         let r = widgets::dropdown_button(ui, app, "ribbon-display", "", true)
             .on_hover_text("Ribbon Display Options");
-        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Ribbon Display Options"));
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Ribbon Display Options"));
         egui::Popup::menu(&r).show(|ui| ribbon_display_menu(ui, app));
     });
 }
@@ -932,7 +932,7 @@ fn tab_button(
     let h = ui.available_height();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     let info = label.to_owned();
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, info.clone()));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, info.clone()));
     if resp.has_focus() {
         ui.painter().rect_stroke(
             rect.shrink2(vec2(0.5, 2.5)),
@@ -969,7 +969,7 @@ fn keytip_badge(ui: &Ui, rect: Rect, text: &str, theme: &Theme) {
         return;
     }
     let painter =
-        ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("mc_keytips")));
+        ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("mc_keytips")));
     let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(11.0), theme.text);
     let size = vec2(galley.size().x + 8.0, galley.size().y + 2.0);
     let badge = Rect::from_center_size(pos2(rect.center().x, rect.bottom()), size);
@@ -1128,7 +1128,7 @@ pub fn status_bar(ui: &mut Ui, app: &mut App, frame: &Frame) {
     let theme = app.theme.clone();
     ui.painter().rect_filled(bar, CornerRadius::ZERO, theme.ribbon);
     ui.painter().hline(bar.x_range(), bar.top() + 0.5, Stroke::new(1.0, theme.separator));
-    let bg = ui.interact(bar, ui.id().with("mc_status_bg"), Sense::click());
+    let bg = ui.interact(bar, ui.scope_id().with("mc_status_bg"), Sense::click());
     bg.context_menu(|ui| crate::menus::status_bar_menu(ui, app));
     let items = crate::menus::status_bar_items_of(ui.ctx(), app);
 
@@ -1459,7 +1459,7 @@ fn pane(
 
 /// A drag handle over the gap `rect`; returns the drag delta along its axis.
 fn splitter(ui: &mut Ui, salt: &str, rect: Rect, horizontal_drag: bool, theme: &Theme) -> f32 {
-    let resp = ui.interact(rect, ui.id().with(salt), Sense::drag());
+    let resp = ui.interact(rect, ui.scope_id().with(salt), Sense::drag());
     if resp.hovered() || resp.dragged() {
         ui.ctx().set_cursor_icon(if horizontal_drag {
             egui::CursorIcon::ResizeHorizontal
@@ -1689,7 +1689,7 @@ mod tests {
     fn bands_and_keyboard_focus_on_tabs_and_status_bar() {
         use egui_kittest::kittest::Queryable;
         let app = App::new(mailcraft_engine::sample::sample_session());
-        let mut h = egui_kittest::Harness::builder()
+        let mut h = crate::test_harness()
             .with_size(egui::vec2(1400.0, 900.0))
             .build_ui_state(|ui, app: &mut App| app.ui_root(ui), app);
         h.run();
@@ -1753,7 +1753,7 @@ mod tests {
                 .unwrap_or_default();
             let initials = mailcraft_engine::queries::initials(Some(name.as_str()), &addr);
             assert!(!initials.is_empty());
-            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(200.0, 60.0)).build_ui_state(
+            let mut h = crate::test_harness().with_size(egui::vec2(200.0, 60.0)).build_ui_state(
                 |ui, app: &mut App| {
                     let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(size::ACCOUNT_BUTTON_W, 40.0));
                     account_button(ui, app, rect);
@@ -1798,7 +1798,7 @@ mod tests {
         assert!(!crate::dialogs::search_highlight_on(&app.s), "the list reads the setting itself");
         assert_eq!(crate::dialogs::ui_pref(&ctx, "readingPane.singleKey"), Some(json!(true)));
         // A dialog's own setting is saved in the profile settings (not the mirrors).
-        let id = egui::Id::new(UI_PREFS_ID);
+        let id = egui::Id::unique(UI_PREFS_ID);
         let mut p = ctx.data_mut(|d| d.get_temp::<UiPrefs>(id)).unwrap_or_default();
         p.values.insert("columns.7".into(), json!(["from", "subject"]));
         p.rev += 1;
@@ -1817,7 +1817,7 @@ mod tests {
     fn status_bar_items_follow_the_engine_and_keep_zoom_when_narrow() {
         use egui_kittest::kittest::Queryable;
         let app = App::new(mailcraft_engine::sample::sample_session());
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(400.0, 30.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(egui::vec2(400.0, 30.0)).build_ui_state(
             |ui, app: &mut App| {
                 let frame = Frame::compute(400.0, 400.0);
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| status_bar(ui, app, &frame));
@@ -1839,7 +1839,7 @@ mod tests {
         // Saved with the profile settings; the shell's own dialog settings leave it alone.
         let ctx = h.ctx.clone();
         sync_ui_prefs(&ctx, h.state_mut());
-        let id = egui::Id::new(UI_PREFS_ID);
+        let id = egui::Id::unique(UI_PREFS_ID);
         let mut p = ctx.data_mut(|d| d.get_temp::<UiPrefs>(id)).unwrap_or_default();
         p.values.insert("columns.7".into(), json!(["a"]));
         // A stale copy of the engine's key in the shell's memory must not overwrite the engine's value.
@@ -1858,7 +1858,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut app = App::new(mailcraft_engine::sample::sample_session());
         app.run("view.todoBar", json!({"part": "tasks"}));
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1600.0, 900.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(egui::vec2(1600.0, 900.0)).build_ui_state(
             |ui, app: &mut App| {
                 let frame = Frame::compute(1600.0, 900.0);
                 main_window(ui, app, &frame);
@@ -1883,7 +1883,7 @@ mod tests {
         assert!(qat_below(&app));
         app.run("options.set", json!({"key": "qat.show", "value": false}));
         assert!(!qat_below(&app));
-        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
             |ui, app: &mut App| {
                 let frame = Frame::compute(1200.0, 800.0);
                 main_window(ui, app, &frame);

@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Id, Layout, Rect, Response, Sense, Stroke, StrokeKind, Ui,
-    UiBuilder, Vec2, WidgetInfo, WidgetType, pos2, vec2,
+    Align, Align2, Color32, CornerRadius, FontId, Id, Layout, Rect, Response, Role, Sense, Stroke,
+    StrokeKind, Ui, UiBuilder, Vec2, WidgetInfo, pos2, vec2,
 };
 use mailcraft_engine::cmd::calendar::CalendarViewState;
 use mailcraft_engine::cmd::notes::NotesViewState;
@@ -108,12 +108,12 @@ impl CalSlice {
 }
 
 fn state_id() -> Id {
-    Id::new("mailcraft.modules.state")
+    Id::unique("mailcraft.modules.state")
 }
 
 /// Where the calendar part of a window other than the main one is kept.
 fn slice_id(viewport: egui::ViewportId) -> Id {
-    Id::new(("mailcraft.modules.calendar.window", viewport))
+    Id::unique(("mailcraft.modules.calendar.window", viewport))
 }
 
 /// The module state as the window being drawn sees it: the shared state with that window's calendar part
@@ -450,7 +450,7 @@ pub(crate) fn module_folder_pane(ui: &mut Ui, app: &mut App) -> (Option<Rect>, R
     let auto =
         setting == FolderPaneState::Normal && (app.s.view.reading_view || window_w <= size::AUTO_MINIMIZE_W);
     let minimized = setting == FolderPaneState::Minimized || auto;
-    let flyout_id = Id::new("mc-modules-folder-flyout");
+    let flyout_id = Id::unique("mc-modules-folder-flyout");
     let mut flyout = minimized && ui.ctx().data(|d| d.get_temp::<bool>(flyout_id)).unwrap_or(false);
     let roomy = full.width() > size::FOLDER_PANE + 200.0;
     let theme = app.theme.clone();
@@ -460,7 +460,7 @@ pub(crate) fn module_folder_pane(ui: &mut Ui, app: &mut App) -> (Option<Rect>, R
         let bar = Rect::from_min_size(pane.min, vec2(pane.width(), PANE_BAR));
         pane_bg(ui, pane, theme.pane);
         let b = Rect::from_center_size(pos2(bar.right() - 16.0, bar.center().y), Vec2::splat(19.0));
-        let resp = ui.interact(b, Id::new("mc-modules-folder-minimize"), Sense::click());
+        let resp = ui.interact(b, Id::unique("mc-modules-folder-minimize"), Sense::click());
         if resp.hovered() {
             ui.painter().rect_filled(b, CornerRadius::same(3), theme.hover);
         }
@@ -470,7 +470,7 @@ pub(crate) fn module_folder_pane(ui: &mut Ui, app: &mut App) -> (Option<Rect>, R
             "chevron-left",
             theme.text_muted,
         );
-        a11y(&resp, WidgetType::Button, "Minimize the Folder Pane");
+        a11y(&resp, Role::Button, "Minimize the Folder Pane");
         if resp.on_hover_text("Minimize the Folder Pane").clicked() {
             if minimized {
                 flyout = false;
@@ -484,7 +484,7 @@ pub(crate) fn module_folder_pane(ui: &mut Ui, app: &mut App) -> (Option<Rect>, R
         let main = Rect::from_min_max(pos2(strip.max.x + GAP, full.min.y), full.max);
         pane_bg(ui, strip, theme.pane);
         let b = Rect::from_min_size(pos2(strip.center().x - 9.5, strip.top() + 7.5), Vec2::splat(19.0));
-        let resp = ui.interact(b, Id::new("mc-modules-folder-expand"), Sense::click());
+        let resp = ui.interact(b, Id::unique("mc-modules-folder-expand"), Sense::click());
         if resp.hovered() || flyout {
             ui.painter().rect_filled(b, CornerRadius::same(3), theme.hover);
         }
@@ -494,7 +494,7 @@ pub(crate) fn module_folder_pane(ui: &mut Ui, app: &mut App) -> (Option<Rect>, R
             "chevron-right",
             theme.text_muted,
         );
-        a11y(&resp, WidgetType::Button, "Expand the Folder Pane");
+        a11y(&resp, Role::Button, "Expand the Folder Pane");
         if resp.on_hover_text("Expand the Folder Pane").clicked() {
             if auto {
                 flyout = !flyout;
@@ -510,7 +510,7 @@ pub(crate) fn module_folder_pane(ui: &mut Ui, app: &mut App) -> (Option<Rect>, R
             let galley = ui.painter().layout(name.clone(), FontId::proportional(13.0), theme.text, room);
             let len = galley.size().x.min(room);
             let item = Rect::from_min_size(pos2(strip.left(), top - 4.0), vec2(strip.width(), len + 8.0));
-            let iresp = ui.interact(item, Id::new("mc-modules-folder-name"), Sense::click());
+            let iresp = ui.interact(item, Id::unique("mc-modules-folder-name"), Sense::click());
             if iresp.hovered() {
                 ui.painter().rect_filled(item.shrink2(vec2(2.0, 0.0)), CornerRadius::same(3), theme.hover);
             }
@@ -518,7 +518,7 @@ pub(crate) fn module_folder_pane(ui: &mut Ui, app: &mut App) -> (Option<Rect>, R
             ui.painter().with_clip_rect(item).add(
                 egui::epaint::TextShape::new(pos, galley, theme.text).with_angle(std::f32::consts::FRAC_PI_2),
             );
-            a11y(&iresp, WidgetType::Button, &name);
+            a11y(&iresp, Role::Button, &name);
             if iresp.on_hover_text(&name).clicked() && roomy {
                 flyout = !flyout;
             }
@@ -567,7 +567,7 @@ fn picture_texture(
     pic: &mailcraft_model::contact::ContactPicture,
 ) -> Option<egui::TextureHandle> {
     let key = picture_key(pic);
-    let mem = Id::new(("mc-contact-picture", id.0));
+    let mem = Id::unique(("mc-contact-picture", id.0));
     if let Some((k, tex)) = ctx.data(|d| d.get_temp::<(u64, Option<egui::TextureHandle>)>(mem))
         && k == key
     {
@@ -596,7 +596,7 @@ pub(crate) fn child<R>(ui: &mut Ui, rect: Rect, salt: &str, add: impl FnOnce(&mu
 }
 
 /// Adds an accessible name to a painted control.
-pub(crate) fn a11y(resp: &Response, typ: WidgetType, label: &str) {
+pub(crate) fn a11y(resp: &Response, typ: Role, label: &str) {
     let label = label.to_owned();
     resp.widget_info(move || WidgetInfo::labeled(typ, true, label.clone()));
 }
@@ -604,7 +604,7 @@ pub(crate) fn a11y(resp: &Response, typ: WidgetType, label: &str) {
 /// Folder-pane group header ("My Calendars") with an expand chevron; returns true when clicked.
 pub(crate) fn group_header(ui: &mut Ui, app: &mut App, text: &str, collapsed: bool, id: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
-    a11y(&resp, WidgetType::Button, text);
+    a11y(&resp, Role::Button, text);
     if resp.hovered() {
         ui.painter().rect_filled(rect, CornerRadius::same(4), app.theme.hover);
     }
@@ -654,7 +654,7 @@ pub(crate) fn folder_rows(
     for (label, id) in folders {
         let (rect, resp) =
             ui.allocate_exact_size(vec2(ui.available_width(), size::FOLDER_ROW), Sense::click());
-        a11y(&resp, WidgetType::Button, &label);
+        a11y(&resp, Role::Button, &label);
         let is_sel = selected == Some(id);
         if is_sel {
             ui.painter().rect_filled(rect, CornerRadius::same(4), app.theme.selected_folder);
@@ -665,8 +665,8 @@ pub(crate) fn folder_rows(
         if let Some(checks) = checks {
             let on = checks.contains(&id.0);
             let b = Rect::from_center_size(pos2(x + 7.0, rect.center().y), Vec2::splat(13.0));
-            let bresp = ui.interact(b.expand(3.0), Id::new(("mc-folder-check", id.0)), Sense::click());
-            a11y(&bresp, WidgetType::Checkbox, &format!("Show {label}"));
+            let bresp = ui.interact(b.expand(3.0), Id::unique(("mc-folder-check", id.0)), Sense::click());
+            a11y(&bresp, Role::CheckBox, &format!("Show {label}"));
             draw_check(ui, b, on, app.theme.accent, app.theme.text_muted);
             if bresp.clicked() {
                 toggled = Some(id);
@@ -854,7 +854,7 @@ pub(crate) fn group_row_at(
 ) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
     let state = if collapsed { "collapsed" } else { "expanded" };
-    a11y(&resp, WidgetType::Button, &format!("Group {label}: {count} items, {state}"));
+    a11y(&resp, Role::Button, &format!("Group {label}: {count} items, {state}"));
     if resp.hovered() {
         ui.painter().rect_filled(rect, CornerRadius::same(3), app.theme.hover);
     }
@@ -1142,7 +1142,7 @@ mod tests {
             "nav.calendar" => crate::modules::calendar,
             _ => crate::modules::people,
         };
-        let mut h = egui_kittest::Harness::builder()
+        let mut h = crate::test_harness()
             .with_size(vec2(width, 800.0))
             .build_ui_state(move |ui: &mut Ui, app: &mut App| view(ui, app), app);
         h.run_ok();

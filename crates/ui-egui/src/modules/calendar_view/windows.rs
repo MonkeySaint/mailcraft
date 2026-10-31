@@ -432,7 +432,7 @@ fn show_new(app: &mut App, _cu: &mut CalUi, out: &Value) {
 
 fn window<'a>(title: &'a str, id: &'a str) -> egui::Window<'a> {
     egui::Window::new(title)
-        .id(Id::new(id))
+        .id(Id::unique(id))
         .collapsible(false)
         .resizable(false)
         .default_width(440.0)

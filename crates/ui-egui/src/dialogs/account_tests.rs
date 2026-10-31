@@ -17,7 +17,7 @@ use mailcraft_engine::sample::sample_session;
 use mailcraft_model::{AccountId, AccountKind, FolderRole, ItemId, Security};
 
 fn harness(app: App) -> Harness<'static, App> {
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+    let mut h = crate::test_harness().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             crate::backstage::backstage(&ctx, app);
@@ -488,7 +488,7 @@ fn send_receive_progress_lists_accounts_and_errors() {
 }
 
 fn status_harness(app: App) -> Harness<'static, App> {
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 40.0)).build_ui_state(
+    let mut h = crate::test_harness().with_size(egui::vec2(1280.0, 40.0)).build_ui_state(
         |ui, app: &mut App| {
             let frame = app.frame_for(1280.0, 900.0);
             ui.horizontal(|ui| crate::chrome::status_bar(ui, app, &frame));
@@ -554,7 +554,7 @@ fn downloading(app: &mut App, id: u32) {
 }
 
 fn status_harness_at(app: App, width: f32) -> Harness<'static, App> {
-    let mut h = Harness::builder().with_size(egui::vec2(width, 40.0)).build_ui_state(
+    let mut h = crate::test_harness().with_size(egui::vec2(width, 40.0)).build_ui_state(
         move |ui, app: &mut App| {
             let frame = app.frame_for(width, 900.0);
             ui.horizontal(|ui| crate::chrome::status_bar(ui, app, &frame));
@@ -573,7 +573,8 @@ fn status_bar_and_progress_window_count_the_first_download() {
     app.s.poll_sync();
     downloading(&mut app, id);
     let h = status_harness(app);
-    assert!(h.query_by_label(full).is_some(), "the status bar says how far the download has got");
+    // The progress bar beside it carries the same text (its tooltip names it since egui 0.37).
+    assert!(h.query_all_by_label(full).next().is_some(), "the status bar says how far the download has got");
 
     // A narrow window keeps the counts rather than cutting them off.
     let mut app = sample_app();
@@ -776,7 +777,7 @@ fn backstage_account_settings_menu() {
 fn the_shell_polls_send_receive_every_frame() {
     let mut app = sample_app();
     let id = add_local_imap(&mut app, "pat@example.net");
-    let mut h = Harness::builder()
+    let mut h = crate::test_harness()
         .with_size(egui::vec2(1280.0, 900.0))
         .build_ui_state(|ui, app: &mut App| app.ui_root(ui), app);
     h.run_steps(2);
@@ -1496,7 +1497,7 @@ fn the_oauth_section_opened_by_the_wizard_can_be_closed() {
 /// The width of the first dialog's window (its area, which grows with contents wider than the window).
 fn dialog_width(h: &Harness<'_, App>) -> f32 {
     let uid = h.state().ui.dialogs[0].1["_dlg"].as_u64().unwrap();
-    h.ctx.memory(|m| m.area_rect(egui::Id::new(("mc-dialog", uid)))).unwrap().width()
+    h.ctx.memory(|m| m.area_rect(egui::Id::unique(("mc-dialog", uid)))).unwrap().width()
 }
 
 #[test]

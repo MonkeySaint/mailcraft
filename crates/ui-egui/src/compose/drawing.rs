@@ -105,7 +105,7 @@ struct Mem {
 }
 
 fn mem_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-drawings", cid))
+    Id::unique(("mailcraft-compose-drawings", cid))
 }
 
 /// Textures of drawn objects, by content key.
@@ -115,7 +115,7 @@ struct Textures {
 }
 
 fn textures_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-drawing-textures", cid))
+    Id::unique(("mailcraft-compose-drawing-textures", cid))
 }
 
 fn key_of(d: &Drawing, theme: &mailcraft_engine::compose::ResolvedTheme, with_text: bool) -> u64 {
@@ -686,7 +686,7 @@ pub(crate) fn flush(ctx: &egui::Context, host: &mut dyn EditorHost, cid: u64) {
 }
 
 fn edit_focus_id() -> Id {
-    Id::new("mailcraft-compose-drawing-edit-focus")
+    Id::unique("mailcraft-compose-drawing-edit-focus")
 }
 
 /// The compose whose drawing text has the keyboard focus, if any (formatting shortcuts then do not reach the
@@ -1344,13 +1344,13 @@ fn edit_text(
         _ if d.kind == DrawingKind::Shape => egui::Align::Center,
         _ => egui::Align::LEFT,
     };
-    let id = Id::new(("mailcraft-drawing-text", cid, e.id));
+    let id = Id::unique(("mailcraft-drawing-text", cid, e.id));
     let te = egui::TextEdit::multiline(&mut e.text)
         .id(id)
         .frame(egui::Frame::NONE)
         .font(egui::FontId::proportional(px))
         .text_color(Color32::from_rgb(col.r, col.g, col.b))
-        .horizontal_align(align)
+        .align(egui::Align2([align, egui::Align::TOP]))
         .desired_width(r.width())
         .desired_rows(1);
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt(("mailcraft-drawing-edit", cid)));
@@ -1526,7 +1526,7 @@ mod tests {
         // Corner Point from the menu, then Straight Segment, then Open Path.
         let click = |at: &PointMenu, label: &str| {
             let mut pick = None;
-            let mut h = egui_kittest::Harness::new_ui(|ui| {
+            let mut h = crate::test_harness().build_ui(|ui| {
                 if let Some(p) = point_menu_ui(ui, at) {
                     pick = Some(p);
                 }

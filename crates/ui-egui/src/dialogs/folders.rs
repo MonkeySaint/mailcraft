@@ -360,7 +360,7 @@ fn confirm(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let pass_on = d.get("dontAsk").and_then(Value::as_bool).unwrap_or(false);
     let dont_ask_key = d.str("dontAsk");
     let offer = pass_on || !dont_ask_key.is_empty();
-    let state_id = egui::Id::new(("mc-confirm-dont-ask", d.uid));
+    let state_id = egui::Id::unique(("mc-confirm-dont-ask", d.uid));
     let mut dont_ask = ctx.data(|m| m.get_temp::<bool>(state_id)).unwrap_or(false);
     let out = window(ctx, app, d, &title, 380.0, |ui, app| {
         ui.horizontal(|ui| {

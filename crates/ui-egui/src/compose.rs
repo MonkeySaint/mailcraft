@@ -58,8 +58,8 @@ mod tests;
 mod voting;
 
 use egui::{
-    Align, Align2, CornerRadius, Id, Layout, Rect, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
-    ViewportBuilder, ViewportClass, ViewportCommand, ViewportId, WidgetInfo, WidgetType, pos2, vec2,
+    Align, Align2, CornerRadius, Id, Layout, Rect, Role, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    ViewportBuilder, ViewportClass, ViewportCommand, ViewportId, WidgetInfo, pos2, vec2,
 };
 use serde_json::json;
 
@@ -213,7 +213,7 @@ impl Field {
 
 /// egui id of a header field of compose `cid`.
 fn field_id(cid: u64, f: Field) -> Id {
-    Id::new(("mailcraft-compose-field", cid, f))
+    Id::unique(("mailcraft-compose-field", cid, f))
 }
 
 /// The compose whose header field or body has keyboard focus, if any (for the keyboard handler: compose
@@ -243,7 +243,7 @@ struct WinState {
 }
 
 fn win_state_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-win", cid))
+    Id::unique(("mailcraft-compose-win", cid))
 }
 
 fn win_state(ctx: &egui::Context, cid: u64) -> WinState {
@@ -306,7 +306,7 @@ pub fn compose_windows(ctx: &egui::Context, app: &mut App) {
 }
 
 fn auto_save_id() -> Id {
-    Id::new("mailcraft-compose-autosave")
+    Id::unique("mailcraft-compose-autosave")
 }
 
 /// The auto-save timer: while a compose (window or inline) has unsaved changes, runs `compose.autoSaveTick`
@@ -607,7 +607,7 @@ fn save_prompt(ctx: &egui::Context, app: &mut App, cid: u64) {
     }
     let mut choice: Option<Option<bool>> = None;
     let theme = app.theme.clone();
-    let modal = egui::Modal::new(Id::new(("mailcraft-compose-save", cid))).show(ctx, |ui| {
+    let modal = egui::Modal::new(Id::unique(("mailcraft-compose-save", cid))).show(ctx, |ui| {
         crate::dialogs::form_visuals(ui, &theme);
         ui.set_min_width(300.0);
         ui.label(egui::RichText::new(SAVE_PROMPT).size(15.0));
@@ -649,7 +649,7 @@ fn separator(ui: &mut Ui, app: &App) {
 /// The big Send button (icon over label).
 fn send_button(ui: &mut Ui, app: &mut App, rect: Rect) -> egui::Response {
     let r = ui.allocate_rect(rect, Sense::click());
-    r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Send"));
+    r.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Send"));
     let fill = if r.is_pointer_button_down_on() {
         app.theme.selected
     } else if r.hovered() {
@@ -696,7 +696,7 @@ fn field_edit(ui: &mut Ui, app: &mut App, cid: u64, f: Field, rect: Rect, label_
         .id(field_id(cid, f))
         .frame(egui::Frame::NONE)
         .text_color(app.theme.text)
-        .vertical_align(Align::Center)
+        .align(egui::Align2::LEFT_CENTER)
         .desired_width(edit_rect.width());
     let mut r = ui.put(edit_rect, te);
     if let Some(l) = label_id {

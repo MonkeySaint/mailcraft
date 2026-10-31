@@ -26,7 +26,7 @@ fn app_with_body(text: &str) -> (App, u64) {
 
 /// Compose windows plus the dialogs area.
 fn harness(app: App) -> Harness<'static, App> {
-    Harness::builder().with_size([1600.0, 1000.0]).build_ui_state(
+    crate::test_harness().with_size([1600.0, 1000.0]).build_ui_state(
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             compose_windows(&ctx, app);
@@ -148,6 +148,8 @@ fn screenshot_captures_windows_and_screen_clips_through_the_backend() {
         &json!({"compose": cid, "windowId": 8, "window": "Calculator"}),
     );
     run_until(&mut h, |h| dialog_names(h).contains(&"screenshot".to_owned()));
+    // Since egui 0.37 the new dialog's text reaches the accessibility tree a frame after it opens.
+    h.run();
     h.query_by_label_contains("That window has closed.").unwrap();
     h.get_by_label("Cancel").click();
     h.run();

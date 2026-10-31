@@ -20,6 +20,11 @@ use crate::App;
 use crate::menu_keys::{self, Access, Hit, literal};
 
 const ICON: f32 = 16.0;
+
+/// The icon column's place in a row's atoms (found again with `rect` to paint the glyph).
+fn icon_slot() -> egui::IdSalt {
+    egui::IdSalt::new("mc-menu-icon")
+}
 /// Most folders kept in the Move ▸ recent list.
 const MAX_RECENT: usize = 10;
 
@@ -49,11 +54,11 @@ fn row_keyed(
     key: Option<Access>,
     enabled: bool,
 ) -> bool {
-    let id = ui.id().with(("menu-row", text));
+    let id = ui.scope_id().with(("menu-row", text));
     let hit = menu_keys::access(ui, id, key, enabled);
-    let btn = Button::new((Atom::custom(id, vec2(ICON, ICON)), menu_keys::label(ui, text, at)));
+    let btn = Button::new((Atom::custom(icon_slot(), vec2(ICON, ICON)), menu_keys::label(ui, text, at)));
     let resp = ui.add_enabled_ui(enabled, |ui| btn.atom_ui(ui)).inner;
-    if let Some(rect) = resp.rect(id) {
+    if let Some(rect) = resp.rect(icon_slot()) {
         paint_glyph(ui, app, rect, &glyph, enabled);
     }
     menu_keys::drawn(ui, id, resp.response.id);
@@ -117,7 +122,7 @@ fn sub(
     add: impl FnOnce(&mut Ui, &mut App),
 ) {
     let (text, at) = menu_keys::parse(label);
-    let id = ui.id().with(("menu-sub", text.as_str()));
+    let id = ui.scope_id().with(("menu-sub", text.as_str()));
     let hit = menu_keys::access(ui, id, menu_keys::key_at(&text, at, false), enabled);
     let shown = menu_keys::label(ui, &text, at);
     let resp = ui
@@ -127,7 +132,9 @@ fn sub(
             if hit == Hit::Activate {
                 menu_keys::open_submenu(ui, button);
             }
-            let r = ui.menu_button((Atom::custom(id, vec2(ICON, ICON)), shown), |ui| add(ui, app)).response;
+            let r = ui
+                .menu_button((Atom::custom(icon_slot(), vec2(ICON, ICON)), shown), |ui| add(ui, app))
+                .response;
             menu_keys::drawn(ui, id, r.id);
             if hit == Hit::Focus {
                 r.request_focus();
@@ -161,7 +168,7 @@ fn ids_json(ids: &[ItemId]) -> Value {
 struct RecentFolders(Vec<FolderId>);
 
 fn recent_id() -> Id {
-    Id::new("mailcraft.menus.recentFolders")
+    Id::unique("mailcraft.menus.recentFolders")
 }
 
 /// Records `folder` as the most recent Move target (the Move dialog should call this too).
@@ -590,7 +597,7 @@ struct GroupCache {
 
 /// Context menu of a date-group header (acts on every item of the group, which becomes the selection).
 pub fn group_header_menu(ui: &mut Ui, app: &mut App, label: &str) {
-    let cache_id = Id::new("mailcraft.menus.group");
+    let cache_id = Id::unique("mailcraft.menus.group");
     let folder = app.s.selection.folder;
     let cached = ui.ctx().data_mut(|d| d.get_temp::<GroupCache>(cache_id));
     let ids = match cached {
@@ -829,7 +836,7 @@ impl StatusBarItems {
 }
 
 fn status_id() -> Id {
-    Id::new("mailcraft.menus.statusBar")
+    Id::unique("mailcraft.menus.statusBar")
 }
 
 /// Status bar element visibility as last read from the engine (the defaults before the first read).
@@ -912,7 +919,7 @@ pub fn status_bar_menu(ui: &mut Ui, app: &mut App) {
             _ => String::new(),
         };
         let on = items.shown(key);
-        let id = ui.id().with(("status-item", key));
+        let id = ui.scope_id().with(("status-item", key));
         // View Shortcuts (V), Zoom Slider and Zoom (Z) have access keys.
         let letter = match key {
             "viewShortcuts" => Some('V'),
@@ -921,10 +928,10 @@ pub fn status_bar_menu(ui: &mut Ui, app: &mut App) {
         };
         let at = letter.and_then(|c| menu_keys::find_key(label, c));
         let hit = menu_keys::access(ui, id, letter.and_then(Access::plain), true);
-        let btn = Button::new((Atom::custom(id, vec2(ICON, ICON)), menu_keys::label(ui, label, at)))
+        let btn = Button::new((Atom::custom(icon_slot(), vec2(ICON, ICON)), menu_keys::label(ui, label, at)))
             .right_text(value);
         let resp = btn.atom_ui(ui);
-        if let Some(rect) = resp.rect(id) {
+        if let Some(rect) = resp.rect(icon_slot()) {
             paint_glyph(ui, app, rect, &Glyph::Check(on), true);
         }
         menu_keys::drawn(ui, id, resp.response.id);
@@ -1062,7 +1069,7 @@ mod tests {
         let inbox = app.s.mailbox.role_folder(account, FolderRole::Inbox).unwrap();
         app.run("folder.removeFavorite", json!({"folder": inbox.0})).unwrap();
         assert!(app.s.mailbox.folder(inbox).unwrap().favorite_pos.is_none());
-        let mut h = Harness::builder()
+        let mut h = crate::test_harness()
             .with_size(vec2(300.0, 400.0))
             .build_ui_state(move |ui, app: &mut App| account_menu(ui, app, account.0), app);
         h.run();
@@ -1073,7 +1080,7 @@ mod tests {
 
     /// A window with one row whose context menu is `menu`, right-clicked open.
     fn menu_harness(app: App, menu: impl Fn(&mut Ui, &mut App) + 'static) -> Harness<'static, App> {
-        let mut h = Harness::builder().with_size(vec2(900.0, 1000.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(vec2(900.0, 1000.0)).build_ui_state(
             move |ui, app: &mut App| {
                 ui.add_space(10.0);
                 let r = ui.add(egui::Label::new("Menu target").sense(egui::Sense::click()));

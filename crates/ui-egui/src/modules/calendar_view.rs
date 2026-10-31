@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{
     Align, Align2, Color32, ComboBox, CornerRadius, CursorIcon, FontId, Id, Key, Layout, Modifiers, Rect,
-    RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2, WidgetType, pos2, vec2,
+    RichText, Role, ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2,
 };
 use serde_json::{Value, json};
 
@@ -152,11 +152,11 @@ impl WindowUi {
 }
 
 fn ui_id() -> Id {
-    Id::new("mailcraft.modules.calendar.ui")
+    Id::unique("mailcraft.modules.calendar.ui")
 }
 
 fn window_ui_id(viewport: egui::ViewportId) -> Id {
-    Id::new(("mailcraft.modules.calendar.ui.window", viewport))
+    Id::unique(("mailcraft.modules.calendar.ui.window", viewport))
 }
 
 fn load_ui(ctx: &egui::Context) -> CalUi {
@@ -916,7 +916,7 @@ fn paint_block(ui: &Ui, app: &mut App, rect: Rect, o: &Occ, selected: bool, prev
 // ---------------------------------------------------------------------------------------------------------
 
 fn background_id() -> Id {
-    Id::new("mailcraft.modules.calendar.background")
+    Id::unique("mailcraft.modules.calendar.background")
 }
 
 /// Every frame, in any module: internet calendar refreshes that Send/Receive or Update Folder queued
@@ -1128,8 +1128,8 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64
             [(10.0, "chevron-left", "Previous month", -1), (w - 10.0, "chevron-right", "Next month", 1)]
         {
             let r = Rect::from_center_size(pos2(head.min.x + dx, head.center().y), Vec2::splat(18.0));
-            let resp = ui.interact(r, Id::new(("mc-nav-arrow", delta)), Sense::click());
-            a11y(&resp, WidgetType::Button, label);
+            let resp = ui.interact(r, Id::unique(("mc-nav-arrow", delta)), Sense::click());
+            a11y(&resp, Role::Button, label);
             if resp.hovered() {
                 ui.painter().rect_filled(r, CornerRadius::same(3), app.theme.hover);
             }
@@ -1187,8 +1187,8 @@ fn mini_month(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, y: i64
             pos2(grid.min.x + num_w + cell * c as f32, grid.min.y + ch * r as f32),
             vec2(cell, ch),
         );
-        let resp = ui.interact(rect, Id::new(("mc-nav-day", y, m, d)), Sense::click());
-        a11y(&resp, WidgetType::Button, &long_date(d));
+        let resp = ui.interact(rect, Id::unique(("mc-nav-day", y, m, d)), Sense::click());
+        a11y(&resp, Role::Button, &long_date(d));
         let in_month = ymd(d).1 == m;
         let mut color = if in_month { app.theme.text } else { app.theme.text_muted };
         if d == now {
@@ -1345,8 +1345,8 @@ fn calendar_tabs(ui: &mut Ui, app: &mut App, strip: Rect, tabs: &[FolderId], key
         );
         let color = calendar_color32(app, *f);
         let name = app.s.mailbox.folder(*f).map(|x| x.name.clone()).unwrap_or_default();
-        let resp = ui.interact(r, Id::new(("mc-cal-tab", key, f.0)), Sense::click());
-        a11y(&resp, WidgetType::Button, &name);
+        let resp = ui.interact(r, Id::unique(("mc-cal-tab", key, f.0)), Sense::click());
+        a11y(&resp, Role::Button, &name);
         ui.painter().rect_filled(
             r,
             CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 },
@@ -1374,12 +1374,12 @@ fn folder_bar(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look) {
             run_view_cmd(app, st, "calendar.today", json!({}));
         }
         let prev = crate::widgets::icon_only(ui, app, "chevron-left", "Previous", true);
-        a11y(&prev, WidgetType::Button, "Previous");
+        a11y(&prev, Role::Button, "Previous");
         if prev.clicked() {
             go_to(app, st, step(st, sel, -1));
         }
         let next = crate::widgets::icon_only(ui, app, "chevron-right", "Next", true);
-        a11y(&next, WidgetType::Button, "Next");
+        a11y(&next, Role::Button, "Next");
         if next.clicked() {
             go_to(app, st, step(st, sel, 1));
         }
@@ -1416,7 +1416,7 @@ fn folder_bar(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look) {
                 run_view_cmd(app, st, "view.changeView", json!({ "name": current.label() }));
             }
             let go = crate::widgets::icon_only(ui, app, "calendar", "Go to Date", true);
-            a11y(&go, WidgetType::Button, "Go to Date");
+            a11y(&go, Role::Button, "Go to Date");
             if go.clicked() {
                 let (date, mode) = (st.cal.date.clone(), st.cal.mode);
                 editors::open_go_to(st, &date, mode);
@@ -1563,9 +1563,9 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
             pos2(rect.min.x + cell_w * c as f32, rect.min.y + head_h + cell_h * r as f32),
             vec2(cell_w, cell_h),
         );
-        let resp = ui.interact(cell, Id::new(("mc-cal-cell", k, d)), Sense::click());
+        let resp = ui.interact(cell, Id::unique(("mc-cal-cell", k, d)), Sense::click());
         let alt = mailcraft_engine::queries::alternate_date(&app.s, d);
-        a11y(&resp, WidgetType::Button, &with_alternate(long_date(d), alt.as_ref()));
+        a11y(&resp, Role::Button, &with_alternate(long_date(d), alt.as_ref()));
         let (_, m, dd) = ymd(d);
         let fill = if d == sel {
             app.theme.selected
@@ -1637,8 +1637,8 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
                 pos2(cell.min.x + 3.0, top + line_h * j as f32),
                 vec2(cell_w - 6.0, line_h - 2.0),
             );
-            let resp = ui.interact(chip, Id::new(("mc-cal-occ", k, o.id.0, d)), Sense::click());
-            a11y(&resp, WidgetType::Button, &occ_a11y(o));
+            let resp = ui.interact(chip, Id::unique(("mc-cal-occ", k, o.id.0, d)), Sense::click());
+            a11y(&resp, Role::Button, &occ_a11y(o));
             let selected = app.ui.module_selection == Some(o.id.0);
             let (fill, bar) = occ_colors(app, o);
             if o.banner() {
@@ -1691,9 +1691,9 @@ fn month_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, pane: 
                 pos2(cell.min.x + 3.0, top + line_h * show as f32),
                 vec2(cell_w - 6.0, line_h - 2.0),
             );
-            let resp = ui.interact(more, Id::new(("mc-cal-more", k, d)), Sense::click());
+            let resp = ui.interact(more, Id::unique(("mc-cal-more", k, d)), Sense::click());
             let text = format!("+{} more", n - show);
-            a11y(&resp, WidgetType::Button, &text);
+            a11y(&resp, Role::Button, &text);
             p.text(
                 pos2(more.min.x + 6.0, more.center().y),
                 Align2::LEFT_CENTER,
@@ -1925,9 +1925,9 @@ fn time_grid_view(
             pos2(rect.min.x + ruler_w + col_w * i as f32, rect.min.y),
             vec2(col_w, head_h),
         );
-        let resp = ui.interact(r, Id::new(("mc-cal-dayhead", k, d)), Sense::click());
+        let resp = ui.interact(r, Id::unique(("mc-cal-dayhead", k, d)), Sense::click());
         let alt = mailcraft_engine::queries::alternate_date(&app.s, d);
-        a11y(&resp, WidgetType::Button, &with_alternate(long_date(d), alt.as_ref()));
+        a11y(&resp, Role::Button, &with_alternate(long_date(d), alt.as_ref()));
         let color = if d == now { app.theme.accent } else { app.theme.text };
         let (_, _, dd) = ymd(d);
         let num = p.text(
@@ -1988,8 +1988,8 @@ fn time_grid_view(
             pos2(strip.min.x + ruler_w + col_w * i as f32, strip.min.y),
             vec2(col_w, strip_h),
         );
-        let resp = ui.interact(r, Id::new(("mc-cal-allday", k, d)), Sense::click());
-        a11y(&resp, WidgetType::Button, &format!("All day, {}", long_date(d)));
+        let resp = ui.interact(r, Id::unique(("mc-cal-allday", k, d)), Sense::click());
+        a11y(&resp, Role::Button, &format!("All day, {}", long_date(d)));
         p.vline(r.min.x, r.y_range(), line);
         if resp.double_clicked() {
             let folder = pane_folder(app, pane);
@@ -2007,8 +2007,8 @@ fn time_grid_view(
             pos2(strip.min.x + ruler_w + col_w * a + 2.0, strip.min.y + 3.0 + LANE_H * lane as f32),
             pos2(strip.min.x + ruler_w + col_w * b - 2.0, strip.min.y + 1.0 + LANE_H * (lane + 1) as f32),
         );
-        let resp = ui.interact(r, Id::new(("mc-cal-banner", k, o.id.0, o.start)), Sense::click());
-        a11y(&resp, WidgetType::Button, &occ_a11y(o));
+        let resp = ui.interact(r, Id::unique(("mc-cal-banner", k, o.id.0, o.start)), Sense::click());
+        a11y(&resp, Role::Button, &occ_a11y(o));
         let selected = app.ui.module_selection == Some(o.id.0);
         paint_block(ui, app, r, o, selected, false);
         occ_interact(app, st, &resp, o);
@@ -2164,8 +2164,8 @@ fn time_grid_view(
                     let x = x0 + col_w * i as f32 + 2.0 + w * c as f32;
                     let r = Rect::from_min_max(pos2(x, y0 + 1.0), pos2(x + w - 1.0, y1 - 1.0));
                     let sense = if o.read_only { Sense::click() } else { Sense::click_and_drag() };
-                    let resp = ui.interact(r, Id::new(("mc-cal-block", k, o.id.0, o.start, d)), sense);
-                    a11y(&resp, WidgetType::Button, &occ_a11y(o));
+                    let resp = ui.interact(r, Id::unique(("mc-cal-block", k, o.id.0, o.start, d)), sense);
+                    a11y(&resp, Role::Button, &occ_a11y(o));
                     // Edges resize (the block's own start/end edges only), the body moves.
                     let edge_of = |pos: egui::Pos2| -> DragKind {
                         if r.height() < 3.0 * EDGE {
@@ -2344,14 +2344,14 @@ fn task_strip(
             );
             let subject =
                 if t.subject.trim().is_empty() { "(No subject)".to_owned() } else { t.subject.clone() };
-            let resp = ui.interact(row, Id::new(("mc-cal-task", key, d, id.0)), Sense::click());
-            a11y(&resp, WidgetType::Button, &format!("Task {subject}"));
+            let resp = ui.interact(row, Id::unique(("mc-cal-task", key, d, id.0)), Sense::click());
+            a11y(&resp, Role::Button, &format!("Task {subject}"));
             if resp.hovered() {
                 p.rect_filled(row, CornerRadius::same(3), app.theme.hover);
             }
             let check = Rect::from_min_size(pos2(row.min.x + 3.0, row.center().y - 6.0), Vec2::splat(12.0));
-            let cresp = ui.interact(check, Id::new(("mc-cal-task-done", key, d, id.0)), Sense::click());
-            a11y(&cresp, WidgetType::Checkbox, &format!("Mark {subject} complete"));
+            let cresp = ui.interact(check, Id::unique(("mc-cal-task-done", key, d, id.0)), Sense::click());
+            a11y(&cresp, Role::CheckBox, &format!("Mark {subject} complete"));
             p.rect_stroke(
                 check,
                 CornerRadius::same(2),
@@ -2682,8 +2682,8 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
                         pos2((x1 - 1.0).max(x0 + 3.0), top + lane_h - 1.0),
                     );
                     let mut resp =
-                        ui.interact(r, Id::new(("mc-cal-sched", o.id.0, o.start, k)), Sense::click());
-                    a11y(&resp, WidgetType::Button, &occ_a11y(o));
+                        ui.interact(r, Id::unique(("mc-cal-sched", o.id.0, o.start, k)), Sense::click());
+                    a11y(&resp, Role::Button, &occ_a11y(o));
                     if r.width() < BLOCK_TEXT_MIN_W + 10.0 {
                         resp = resp.on_hover_text(occ_a11y(o));
                     }
@@ -2698,8 +2698,8 @@ fn schedule_view(ui: &mut Ui, app: &mut App, st: &mut ModState, look: &Look, rec
                     let x = area_rect.min.x + axis.x((at - ds) as f32 / 60.0);
                     let text = format!("+{hidden} more");
                     let more = Rect::from_min_size(pos2(x + 2.0, y + row_h - 18.0), vec2(80.0, 16.0));
-                    let resp = ui.interact(more, Id::new(("mc-cal-sched-more", k, sel)), Sense::click());
-                    a11y(&resp, WidgetType::Button, &text);
+                    let resp = ui.interact(more, Id::unique(("mc-cal-sched-more", k, sel)), Sense::click());
+                    a11y(&resp, Role::Button, &text);
                     p.rect_filled(more, CornerRadius::same(3), app.theme.reading);
                     p.text(
                         pos2(more.min.x + 4.0, more.center().y),

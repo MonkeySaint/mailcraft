@@ -58,7 +58,7 @@ pub fn take_saved_todo_bar(ctx: &egui::Context) -> Option<mailcraft_engine::Todo
 }
 
 fn state_id() -> Id {
-    Id::new("mailcraft.modules.todo-bar")
+    Id::unique("mailcraft.modules.todo-bar")
 }
 
 pub(crate) fn load(ctx: &egui::Context) -> TodoBarState {
@@ -150,8 +150,8 @@ fn calendar_part(ui: &mut Ui, app: &mut App, st: &mut TodoBarState) {
             pos2(grid.min.x + cell * c as f32, grid.min.y + 20.0 * (r as f32 + 1.0)),
             vec2(cell, 20.0),
         );
-        let resp = ui.interact(cr, Id::new(("mc-todo-day", d)), Sense::click());
-        a11y(&resp, egui::WidgetType::Button, &super::common::long_date(d));
+        let resp = ui.interact(cr, Id::unique(("mc-todo-day", d)), Sense::click());
+        a11y(&resp, egui::Role::Button, &super::common::long_date(d));
         let in_month = ymd(d).1 == m;
         let mut color = if in_month { app.theme.text } else { app.theme.text_muted };
         if d == now {
@@ -226,7 +226,7 @@ fn people_part(ui: &mut Ui, app: &mut App, st: &mut TodoBarState) {
     heading(ui, app, "People");
     let r =
         ui.add(TextEdit::singleline(&mut st.search).hint_text("Search people").desired_width(f32::INFINITY));
-    a11y(&r, egui::WidgetType::TextEdit, "Search people");
+    a11y(&r, egui::Role::TextInput, "Search people");
     let ids: Vec<ItemId> = if st.search.trim().is_empty() {
         let mut all: Vec<_> = app.s.mailbox.contacts.values().filter(|c| !is_group(c)).collect();
         all.sort_by_key(|c| display_name(c).to_lowercase());
@@ -252,7 +252,7 @@ fn tasks_part(ui: &mut Ui, app: &mut App, st: &mut TodoBarState) {
     let resp = ui.add(
         TextEdit::singleline(&mut st.new_task).hint_text("Type a new task").desired_width(f32::INFINITY),
     );
-    a11y(&resp, egui::WidgetType::TextEdit, "Type a new task");
+    a11y(&resp, egui::Role::TextInput, "Type a new task");
     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !st.new_task.trim().is_empty() {
         let subject = std::mem::take(&mut st.new_task);
         let mut p = json!({ "subject": subject.trim(), "due": day_string(today(app)) });
@@ -331,7 +331,8 @@ mod tests {
         let ctx = egui::Context::default();
         assert_eq!(saved_todo_bar(&ctx), None);
         ctx.data_mut(|d| {
-            let p = d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::new(crate::chrome::UI_PREFS_ID));
+            let p =
+                d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::unique(crate::chrome::UI_PREFS_ID));
             p.values.insert(PREF_KEY.to_owned(), json!(["people", "tasks"]));
         });
         let t = saved_todo_bar(&ctx).unwrap();
@@ -339,7 +340,8 @@ mod tests {
         // Junk in the saved value shows nothing rather than failing.
         let junk = egui::Context::default();
         junk.data_mut(|d| {
-            let p = d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::new(crate::chrome::UI_PREFS_ID));
+            let p =
+                d.get_temp_mut_or_default::<crate::chrome::UiPrefs>(Id::unique(crate::chrome::UI_PREFS_ID));
             p.values.insert(PREF_KEY.to_owned(), json!([1, null, "mail"]));
         });
         assert!(!saved_todo_bar(&junk).unwrap().shown());

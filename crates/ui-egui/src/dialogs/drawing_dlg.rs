@@ -62,7 +62,7 @@ fn png_texture(
     key: &str,
     png: impl FnOnce() -> Option<Vec<u8>>,
 ) -> Option<egui::TextureHandle> {
-    let id = egui::Id::new(("mailcraft-dialog-png", key));
+    let id = egui::Id::unique(("mailcraft-dialog-png", key));
     if let Some(t) = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
         return t;
     }
@@ -77,7 +77,7 @@ fn png_texture(
 type Preview = (String, Option<egui::TextureHandle>);
 
 fn preview_id(uid: u64) -> egui::Id {
-    egui::Id::new(("mailcraft-dialog-preview", uid))
+    egui::Id::unique(("mailcraft-dialog-preview", uid))
 }
 
 /// The preview of dialog `uid` for `key` (the chart or graphic it shows): one texture per dialog, replaced
@@ -189,7 +189,7 @@ fn insert_icons(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                                 );
                             }
                             resp.widget_info(|| {
-                                egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, picked, *label)
+                                egui::WidgetInfo::selected(egui::Role::CheckBox, true, picked, *label)
                             });
                             let resp = resp.on_hover_text(*label);
                             if resp.clicked() {
@@ -371,7 +371,7 @@ fn sheet_editor(ui: &mut Ui, app: &App, uid: u64, sheet: &mut Vec<Vec<String>>) 
                     let te = if header {
                         te.font(egui::TextStyle::Body)
                     } else {
-                        te.horizontal_align(egui::Align::RIGHT)
+                        te.align(egui::Align2::RIGHT_TOP)
                     };
                     let resp = ui.add(te);
                     let name = match (r, c) {
@@ -379,7 +379,7 @@ fn sheet_editor(ui: &mut Ui, app: &App, uid: u64, sheet: &mut Vec<Vec<String>>) 
                         (_, 0) => format!("Category {r} name"),
                         _ => format!("Row {r}, series {c}"),
                     };
-                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, &name));
+                    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, &name));
                 }
                 ui.end_row();
             }

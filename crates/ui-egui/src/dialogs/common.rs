@@ -2,8 +2,7 @@
 //! tree picker and small value helpers. Look is our own (theme tokens); sizes follow plan/reference/dialogs.md.
 
 use egui::{
-    Align, Align2, Color32, Context, Id, Key, Layout, Modifiers, RichText, Sense, Ui, Vec2, WidgetInfo,
-    WidgetType,
+    Align, Align2, Color32, Context, Id, Key, Layout, Modifiers, RichText, Role, Sense, Ui, Vec2, WidgetInfo,
 };
 use serde_json::{Value, json};
 
@@ -90,7 +89,7 @@ pub(crate) fn with_state<T: Clone + Send + Sync + 'static>(
     init: impl FnOnce(&App) -> T,
     f: impl FnOnce(&mut T, &mut App) -> Out,
 ) -> Out {
-    let id = Id::new(("mc-dialog-state", uid));
+    let id = Id::unique(("mc-dialog-state", uid));
     let mut st = match ctx.data_mut(|d| d.get_temp::<T>(id)) {
         Some(st) => st,
         None => init(app),
@@ -108,14 +107,14 @@ type Replies = Vec<(String, Value)>;
 
 /// Sends `value` under `key` to the dialog `to` (read with [`take_replies`]).
 pub(crate) fn send_reply(ctx: &Context, to: u64, key: &str, value: Value) {
-    let id = Id::new(("mc-dialog-reply", to));
+    let id = Id::unique(("mc-dialog-reply", to));
     ctx.data_mut(|d| d.get_temp_mut_or_default::<Replies>(id).push((key.to_owned(), value)));
     ctx.request_repaint();
 }
 
 /// Replies sent to dialog `uid` since the last call.
 pub(crate) fn take_replies(ctx: &Context, uid: u64) -> Replies {
-    let id = Id::new(("mc-dialog-reply", uid));
+    let id = Id::unique(("mc-dialog-reply", uid));
     ctx.data_mut(|d| d.remove_temp::<Replies>(id)).unwrap_or_default()
 }
 
@@ -140,17 +139,17 @@ pub(crate) use crate::chrome::UiPrefs;
 const PREFS_ID: &str = crate::chrome::UI_PREFS_ID;
 
 pub(crate) fn prefs(ctx: &Context) -> UiPrefs {
-    ctx.data_mut(|d| d.get_temp::<UiPrefs>(Id::new(PREFS_ID))).unwrap_or_default()
+    ctx.data_mut(|d| d.get_temp::<UiPrefs>(Id::unique(PREFS_ID))).unwrap_or_default()
 }
 
 /// Replaces the dialog settings (bumps their revision so the shell saves them).
 pub(crate) fn set_prefs(ctx: &Context, mut p: UiPrefs) {
     p.rev = prefs(ctx).rev.wrapping_add(1);
-    ctx.data_mut(|d| d.insert_temp(Id::new(PREFS_ID), p));
+    ctx.data_mut(|d| d.insert_temp(Id::unique(PREFS_ID), p));
 }
 
 pub(crate) fn pref(ctx: &Context, key: &str) -> Option<Value> {
-    ctx.data_mut(|d| d.get_temp_mut_or_default::<UiPrefs>(Id::new(PREFS_ID)).values.get(key).cloned())
+    ctx.data_mut(|d| d.get_temp_mut_or_default::<UiPrefs>(Id::unique(PREFS_ID)).values.get(key).cloned())
 }
 
 pub(crate) fn set_pref(ctx: &Context, key: &str, v: Value) {
@@ -202,10 +201,10 @@ pub(crate) fn window(
         .stroke(egui::Stroke::new(1.0, t.separator))
         .corner_radius(6.0)
         .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(60) });
-    ctx.data_mut(|m| m.insert_temp(Id::new(TOP_FLAG), d.top));
+    ctx.data_mut(|m| m.insert_temp(Id::unique(TOP_FLAG), d.top));
     // A newly shown topmost dialog takes keyboard focus from whatever had it (e.g. the button that opened it),
     // so Enter/Space go to this dialog.
-    let seen = Id::new(("mc-dialog-seen", d.uid));
+    let seen = Id::unique(("mc-dialog-seen", d.uid));
     if d.top && !ctx.data_mut(|m| m.get_temp::<bool>(seen)).unwrap_or(false) {
         ctx.data_mut(|m| m.insert_temp(seen, true));
         ctx.memory_mut(|m| {
@@ -214,7 +213,7 @@ pub(crate) fn window(
             }
         });
     }
-    let layer = Id::new(("mc-dialog", d.uid));
+    let layer = Id::unique(("mc-dialog", d.uid));
     let contents = |ui: &mut Ui| {
         ui.set_width(width.min(ctx.content_rect().width() - 24.0).max(200.0));
         dialog_visuals(ui, &t);
@@ -285,7 +284,7 @@ pub(crate) fn dialog_visuals(ui: &mut Ui, t: &crate::theme::Theme) {
 
 fn title_close(ui: &mut Ui, app: &mut App) -> bool {
     let (rect, r) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
-    r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Close dialog"));
+    r.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Close dialog"));
     if r.hovered() {
         ui.painter().rect_filled(rect, 4.0, app.theme.hover);
     }
@@ -337,7 +336,7 @@ const TOP_FLAG: &str = "mc-dialog-drawing-top";
 
 /// Enter pressed while the dialog being drawn is the topmost one (default-button activation).
 pub(crate) fn enter_pressed(ui: &Ui) -> bool {
-    let top = ui.ctx().data_mut(|m| m.get_temp::<bool>(Id::new(TOP_FLAG))).unwrap_or(false);
+    let top = ui.ctx().data_mut(|m| m.get_temp::<bool>(Id::unique(TOP_FLAG))).unwrap_or(false);
     top && ui.input(|i| i.key_pressed(Key::Enter) && i.modifiers.is_none())
 }
 
@@ -419,7 +418,7 @@ pub(crate) fn date_box(
     hint: &str,
     label: &str,
 ) -> bool {
-    let id = Id::new(("mc-date-box", id));
+    let id = Id::unique(("mc-date-box", id));
     let before = text.clone();
     ui.horizontal(|ui| {
         let ok = text.trim().is_empty() || parse_ymd(text).is_some();
@@ -428,7 +427,7 @@ pub(crate) fn date_box(
             edit = edit.text_color(app.theme.danger);
         }
         let r = ui.add(edit).on_hover_text("Date as YYYY-MM-DD");
-        r.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, label));
+        r.widget_info(|| WidgetInfo::labeled(Role::TextInput, true, label));
         let pick = ui.menu_button("\u{25BE}", |ui| {
             let today = parse_ymd(&today(app)).unwrap_or((2026, 1, 1));
             let (y, m) = shown_month(ui, id)
@@ -504,10 +503,10 @@ pub(crate) fn time_box(
     label: &str,
 ) -> bool {
     let before = text.clone();
-    let id = Id::new(("mc-time-box", id));
+    let id = Id::unique(("mc-time-box", id));
     ui.horizontal(|ui| {
         let r = ui.add(egui::TextEdit::singleline(text).desired_width(52.0).id_salt(id));
-        r.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, label));
+        r.widget_info(|| WidgetInfo::labeled(Role::TextInput, true, label));
         ui.menu_button("\u{25BE}", |ui| {
             egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                 for half in 0..48u32 {
@@ -683,7 +682,7 @@ fn tree_rows(
     let w = ui.available_width();
     let (rect, r) =
         ui.allocate_exact_size(Vec2::new(w, row_h), if ok { Sense::click() } else { Sense::hover() });
-    r.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, ok, selected, &f.name));
+    r.widget_info(|| WidgetInfo::selected(Role::Button, ok, selected, &f.name));
     if selected {
         ui.painter().rect_filled(rect, 3.0, app.theme.selected);
     } else if r.hovered() && ok {

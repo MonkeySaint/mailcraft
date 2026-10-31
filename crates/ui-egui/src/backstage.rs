@@ -8,9 +8,7 @@
 //! window's in that compose's viewport (or in the root viewport for an inline response). Page ids: `info`,
 //! `openExport`, `save`, `saveAs`, `saveAttachments`, `print`, `close`, `account`, `options`, `exit`.
 
-use egui::{
-    Align, Color32, Context, Id, Layout, Order, Rect, RichText, Sense, Ui, Vec2, WidgetInfo, WidgetType,
-};
+use egui::{Align, Color32, Context, Id, Layout, Order, Rect, RichText, Role, Sense, Ui, Vec2, WidgetInfo};
 use serde_json::{Value, json};
 
 use crate::dialogs::files;
@@ -50,7 +48,7 @@ pub fn backstage(ctx: &egui::Context, app: &mut App) {
     if root {
         rect.min.y = (rect.min.y + size::TITLE_BAR).min(rect.max.y);
     }
-    egui::Area::new(Id::new(("mc-backstage", viewport_salt(ctx))))
+    egui::Area::new(Id::unique(("mc-backstage", viewport_salt(ctx))))
         .order(Order::Middle)
         .fixed_pos(rect.min)
         .interactable(true)
@@ -58,7 +56,7 @@ pub fn backstage(ctx: &egui::Context, app: &mut App) {
             ui.set_min_size(rect.size());
             ui.set_max_size(rect.size());
             // Swallow clicks so nothing below the page reacts.
-            let _ = ui.interact(rect, Id::new("mc-backstage-blocker"), Sense::click());
+            let _ = ui.interact(rect, Id::unique("mc-backstage-blocker"), Sense::click());
             ui.painter().rect_filled(rect, 0.0, app.theme.pane);
             show_in(ui, app, surface, &page, rect);
         });
@@ -88,7 +86,7 @@ pub fn window_backstage(ui: &mut Ui, app: &mut App, surface: Surface) {
         return;
     }
     let rect = ui.max_rect();
-    let _ = ui.interact(rect, Id::new(("mc-backstage-blocker", surface.key())), Sense::click());
+    let _ = ui.interact(rect, Id::unique(("mc-backstage-blocker", surface.key())), Sense::click());
     ui.painter().rect_filled(rect, 0.0, app.theme.pane);
     let mut child =
         ui.new_child(egui::UiBuilder::new().id_salt(("mc-window-backstage", surface.key())).max_rect(rect));
@@ -96,7 +94,7 @@ pub fn window_backstage(ui: &mut Ui, app: &mut App, surface: Surface) {
 }
 
 fn window_drawn_id() -> Id {
-    Id::new("mc-backstage-window-drawn")
+    Id::unique("mc-backstage-window-drawn")
 }
 
 /// Whether a read window drew the backstage since the last call (clears the mark).
@@ -175,7 +173,7 @@ fn nav_column(ui: &mut Ui, app: &mut App, surface: Surface, page: &str, rect: Re
     let mut clicked = None;
     // Back
     let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 45.0), Sense::click());
-    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Back"));
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Back"));
     if resp.hovered() {
         ui.painter().rect_filled(r, 0.0, Color32::from_white_alpha(24));
     }
@@ -211,7 +209,7 @@ fn nav_column(ui: &mut Ui, app: &mut App, surface: Surface, page: &str, rect: Re
 fn nav_item(ui: &mut Ui, app: &App, label: &str, selected: bool, enabled: bool, h: f32, w: f32) -> bool {
     let (r, resp) =
         ui.allocate_exact_size(Vec2::new(w, h), if enabled { Sense::click() } else { Sense::hover() });
-    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, enabled, selected, label));
+    resp.widget_info(|| WidgetInfo::selected(Role::Button, enabled, selected, label));
     if selected {
         ui.painter().rect_filled(r, 0.0, Color32::from_white_alpha(40));
     } else if resp.hovered() && enabled {
@@ -300,11 +298,11 @@ struct PageState {
 }
 
 fn state(ctx: &Context) -> PageState {
-    ctx.data_mut(|d| d.get_temp::<PageState>(Id::new("mc-backstage-state"))).unwrap_or_default()
+    ctx.data_mut(|d| d.get_temp::<PageState>(Id::unique("mc-backstage-state"))).unwrap_or_default()
 }
 
 fn set_state(ctx: &Context, st: PageState) {
-    ctx.data_mut(|d| d.insert_temp(Id::new("mc-backstage-state"), st));
+    ctx.data_mut(|d| d.insert_temp(Id::unique("mc-backstage-state"), st));
 }
 
 fn page_ui(ui: &mut Ui, app: &mut App, surface: Surface, page: &str) {
@@ -383,7 +381,7 @@ fn tile_full(
             Vec2::new(97.0, 86.0),
             if enabled { Sense::click() } else { Sense::hover() },
         );
-        resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, label));
         let stroke = if resp.hovered() && enabled { app.theme.accent } else { app.theme.separator };
         ui.painter().rect(
             r,
@@ -662,7 +660,7 @@ fn size_bar(ui: &mut Ui, app: &App, quota: Option<mailcraft_engine::MailboxQuota
     let used = quota.map_or(0, |q| q.used);
     resp.widget_info(|| {
         WidgetInfo::labeled(
-            WidgetType::ProgressIndicator,
+            Role::ProgressIndicator,
             true,
             format!("{:.0}% of the mailbox limit used", frac * 100.0),
         )
@@ -1107,7 +1105,7 @@ impl PrintSettings {
 }
 
 fn print_settings_id() -> Id {
-    Id::new("mc-print-settings")
+    Id::unique("mc-print-settings")
 }
 
 /// The session's print settings (printers fetched on first use).
@@ -1240,7 +1238,7 @@ fn print(ui: &mut Ui, app: &mut App, surface: Surface, st: &mut PageState) {
         ui.vertical(|ui| {
             ui.set_width(260.0);
             let (r, resp) = ui.allocate_exact_size(Vec2::new(90.0, 90.0), Sense::click());
-            resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Print"));
+            resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Print"));
             ui.painter().rect(
                 r,
                 4.0,
@@ -1359,7 +1357,7 @@ fn print(ui: &mut Ui, app: &mut App, surface: Surface, st: &mut PageState) {
                     egui::Frame::new().fill(Color32::WHITE).inner_margin(18.0).show(ui, |ui| {
                         ui.visuals_mut().override_text_color = Some(Color32::from_rgb(0x20, 0x20, 0x20));
                         ui.label(RichText::new(&c.subject).strong());
-                        let id = Id::new(("mc-bs-compose-preview", c.id));
+                        let id = Id::unique(("mc-bs-compose-preview", c.id));
                         let mut view = ui
                             .ctx()
                             .data_mut(|d| d.get_temp::<crate::body::BodyView>(id))
@@ -1463,7 +1461,7 @@ fn page_texture(
     ((scale * 100.0).round() as i64).hash(&mut h);
     mailbox_stamp(app).hash(&mut h);
     let key = h.finish();
-    let id = Id::new((salt, "tex", slot));
+    let id = Id::unique((salt, "tex", slot));
     if let Some(t) = ui.ctx().data_mut(|d| d.get_temp::<PreviewTex>(id))
         && t.key == key
     {
@@ -1508,8 +1506,10 @@ pub fn print_preview(
     height: f32,
 ) {
     // Page count and size from the cached first slot (or Letter before the first render).
-    let first =
-        ui.ctx().data_mut(|d| d.get_temp::<PreviewTex>(Id::new((salt, "tex", 0usize)))).unwrap_or_default();
+    let first = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<PreviewTex>(Id::unique((salt, "tex", 0usize))))
+        .unwrap_or_default();
     let pages = first.pages.max(1);
     ps.page = ps.page.min(pages - 1);
     ui.horizontal(|ui| {
@@ -1519,7 +1519,7 @@ pub fn print_preview(
         }
         let mut cur = ps.page + 1;
         let r = ui.add(egui::DragValue::new(&mut cur).range(1..=pages).speed(0.1));
-        r.widget_info(|| WidgetInfo::labeled(WidgetType::DragValue, true, "Current Page"));
+        r.widget_info(|| WidgetInfo::labeled(Role::SpinButton, true, "Current Page"));
         ps.page = cur.clamp(1, pages) - 1;
         ui.label(format!("of {pages}"));
         let next = ui.add_enabled(ps.page + 1 < pages, egui::Button::new("▶")).on_hover_text("Next Page");
@@ -1700,7 +1700,7 @@ mod tests {
         let (_, ex, local) = session();
         let page = |account: u32| {
             let app = crate::App::new(session().0);
-            let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(900.0, 1400.0)).build_ui_state(
+            let mut h = crate::test_harness().with_size(egui::vec2(900.0, 1400.0)).build_ui_state(
                 move |ui, app: &mut crate::App| {
                     let mut st = super::PageState { account: Some(account), ..Default::default() };
                     super::info(ui, app, &mut st);

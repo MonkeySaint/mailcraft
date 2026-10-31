@@ -324,9 +324,7 @@ fn button(
 ) -> Response {
     let sense = if look.enabled { Sense::click() } else { Sense::hover() };
     let resp = ui.interact(rect, id, sense);
-    let kind =
-        if look.check || look.on { egui::WidgetType::SelectableLabel } else { egui::WidgetType::Button };
-    resp.widget_info(|| egui::WidgetInfo::selected(kind, look.enabled, look.on, tip));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, look.enabled, look.on, tip));
     let open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&resp));
     paint_bg(
         ui,
@@ -366,9 +364,9 @@ fn split_button(
     };
     let sense = if look.enabled { Sense::click() } else { Sense::hover() };
     let main = ui.interact(main_r, id, sense);
-    main.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, look.enabled, tip));
+    main.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, look.enabled, tip));
     let arrow = ui.interact(arrow_r, id.with("arrow"), Sense::click());
-    arrow.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{tip} options")));
+    arrow.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{tip} options")));
     let open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&arrow));
     let any_hover = (main.hovered() && look.enabled) || arrow.hovered();
     if any_hover || open || look.on {
@@ -413,7 +411,7 @@ pub fn keeps_menu_open(action: &Action) -> bool {
 fn menu_heading(ui: &mut Ui, app: &App, label: &str) {
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width().max(120.0), 22.0), Sense::hover());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, label));
     ui.painter().rect_filled(rect, CornerRadius::ZERO, app.theme.hover.gamma_multiply(0.5));
     ui.painter().text(
         Pos2::new(rect.left() + 8.0, rect.center().y),
@@ -458,10 +456,8 @@ fn menu_row_in(
         if enabled { Sense::click() } else { Sense::hover() },
     );
     match on {
-        Some(on) => {
-            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, on, label))
-        }
-        None => resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label)),
+        Some(on) => resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, on, label)),
+        None => resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label)),
     }
     let t = app.theme.clone();
     if resp.hovered() && enabled {
@@ -555,11 +551,11 @@ fn menu_grid(
             let rect = Rect::from_min_size(min, Vec2::splat(CELL));
             let resp = ui.interact(
                 rect,
-                ui.id().with(("table-grid", c, r)),
+                ui.scope_id().with(("table-grid", c, r)),
                 if enabled { Sense::click() } else { Sense::hover() },
             );
             let label = grid_cell_label(c + 1, r + 1);
-            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &label));
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, &label));
             if resp.hovered() {
                 hovered = Some((c, r));
             }
@@ -848,7 +844,7 @@ fn draw_ctl(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, rect: Rect, st: St
 fn combo(ui: &mut Ui, app: &mut App, cx: &mut Cx, c: &Ctl, id: Id, rect: Rect) {
     let r = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 22.0f32.min(rect.height())));
     let resp = ui.interact(r, id, Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, c.label.as_str()));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, c.label.as_str()));
     let t = app.theme.clone();
     ui.painter().rect_filled(r, CornerRadius::same(3), t.pane);
     let border = if resp.hovered() || resp.has_focus() { t.accent } else { t.separator };

@@ -346,7 +346,7 @@ struct EquationState {
 /// The preview texture of equation `text` (decoded from the engine's drawing; only the latest is kept).
 fn equation_texture(ctx: &Context, text: &str) -> Option<egui::TextureHandle> {
     type Cached = (String, Option<egui::TextureHandle>);
-    let id = egui::Id::new("equation-preview");
+    let id = egui::Id::unique("equation-preview");
     if let Some((t, tex)) = ctx.data(|m| m.get_temp::<Cached>(id))
         && t == text
     {
@@ -404,7 +404,7 @@ fn equation(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
         }
     }
     let editing = edit.is_some();
-    let edit_id = egui::Id::new(("equation-text", d.uid));
+    let edit_id = egui::Id::unique(("equation-text", d.uid));
     with_state(
         ctx,
         app,
@@ -849,7 +849,7 @@ fn draw_table(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 });
                 let (pad, resp) = ui.allocate_exact_size(Vec2::new(520.0, 300.0), Sense::click_and_drag());
                 resp.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Table drawing area")
+                    egui::WidgetInfo::labeled(egui::Role::Unknown, true, "Table drawing area")
                 });
                 let t = app.theme.clone();
                 let painter = ui.painter_at(pad);
@@ -862,7 +862,7 @@ fn draw_table(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 );
                 let to_pad = |p: Pos2| Pos2::new(p.x - pad.left(), p.y - pad.top());
                 let to_screen = |p: Pos2| Pos2::new(p.x + pad.left(), p.y + pad.top());
-                let drag_id = egui::Id::new(("draw-table-from", d.uid));
+                let drag_id = egui::Id::unique(("draw-table-from", d.uid));
                 // The stroke starts where the button went down (a drag is only recognised after some movement).
                 if resp.drag_started()
                     && let Some(p) =
@@ -1029,7 +1029,7 @@ struct ClipState {
 const MAX_PREVIEW_SIDE: u32 = 4096;
 
 fn clip_texture(ctx: &Context, token: u64, shot: &crate::compose::Captured) -> Option<egui::TextureHandle> {
-    let id = egui::Id::new(("screen-clip-texture", token));
+    let id = egui::Id::unique(("screen-clip-texture", token));
     if let Some(t) = ctx.data(|m| m.get_temp::<egui::TextureHandle>(id)) {
         return Some(t);
     }
@@ -1072,9 +1072,7 @@ fn screen_clip(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
                 let scale = (avail.x / shot.width as f32).min(avail.y / shot.height as f32).min(1.0);
                 let size = Vec2::new(shot.width as f32 * scale, shot.height as f32 * scale);
                 let (rect, resp) = ui.allocate_exact_size(size, Sense::drag());
-                resp.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Captured screen")
-                });
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Unknown, true, "Captured screen"));
                 ui.painter().image(
                     tex.id(),
                     rect,
@@ -1164,7 +1162,7 @@ fn screen_clip(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     );
     if !out.keeps() {
         crate::compose::capture::drop_clip(token);
-        ctx.data_mut(|m| m.remove::<egui::TextureHandle>(egui::Id::new(("screen-clip-texture", token))));
+        ctx.data_mut(|m| m.remove::<egui::TextureHandle>(egui::Id::unique(("screen-clip-texture", token))));
     }
     out
 }

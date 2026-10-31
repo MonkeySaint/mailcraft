@@ -44,7 +44,7 @@ fn inputs_key(app: &App, cid: u64) -> u64 {
 }
 
 fn cache_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-a11y", cid))
+    Id::unique(("mailcraft-compose-a11y", cid))
 }
 
 /// The engine's warning for compose `cid`, cached.
@@ -104,8 +104,8 @@ pub(super) fn bar(ui: &mut Ui, app: &mut App, cid: u64) {
     ui.allocate_ui_with_layout(vec2(width, BAR_H), Layout::left_to_right(Align::Center), |ui| {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, fill);
-        let group = ui.interact(rect, Id::new(("mailcraft-compose-a11y-bar", cid)), egui::Sense::hover());
-        group.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, BAR_LABEL));
+        let group = ui.interact(rect, Id::unique(("mailcraft-compose-a11y-bar", cid)), egui::Sense::hover());
+        group.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Unknown, true, BAR_LABEL));
         ui.add_space(16.0);
         ui.label(RichText::new(text).color(ink));
         ui.add_space(8.0);

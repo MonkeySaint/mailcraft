@@ -174,7 +174,7 @@ pub fn ribbon(ui: &mut egui::Ui, app: &mut App, surface: Surface, frame: &Frame)
     if let Surface::Compose(cid) = surface
         && let Some(c) = app.s.composes.get(&cid)
     {
-        let key = egui::Id::new(("mailcraft-ribbon-drawing-max", cid));
+        let key = egui::Id::unique(("mailcraft-ribbon-drawing-max", cid));
         let newest = c.body.drawings.iter().map(|d| d.id).max().unwrap_or(0);
         let seen = ui.ctx().data(|d| d.get_temp::<u32>(key));
         let fresh = seen.is_some_and(|s| newest > s) && c.selected_drawing == Some(newest);
@@ -206,7 +206,7 @@ pub fn ribbon(ui: &mut egui::Ui, app: &mut App, surface: Surface, frame: &Frame)
         tab,
         keytip,
         mem,
-        id: egui::Id::new(("mailcraft-ribbon", surface_key(surface))),
+        id: egui::Id::unique(("mailcraft-ribbon", surface_key(surface))),
         badges: Vec::new(),
         hidden: hidden_commands(app),
     };

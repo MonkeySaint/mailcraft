@@ -136,7 +136,7 @@ pub(super) fn take_dropped_files(ctx: &egui::Context, app: &mut App, cid: u64, a
 
 fn paint_drop_hint(ctx: &egui::Context, app: &App, area: Rect) {
     let painter =
-        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("mailcraft-drop-hint")));
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::unique("mailcraft-drop-hint")));
     let r = area.shrink(8.0);
     painter.rect_filled(r, CornerRadius::same(6), app.theme.accent.gamma_multiply(0.12));
     painter.rect_stroke(
@@ -228,11 +228,7 @@ pub(super) fn well(ui: &mut Ui, app: &mut App, cid: u64, indent: f32) {
                             .add(egui::Button::new("▾").frame(false).small())
                             .on_hover_text(format!("Attachment options for {name}"));
                         menu.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
-                                true,
-                                format!("Options for {name}"),
-                            )
+                            egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Options for {name}"))
                         });
                         egui::Popup::menu(&menu).show(|ui| {
                             ui.set_min_width(140.0);
@@ -353,7 +349,7 @@ struct SaveAs {
 }
 
 fn save_id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-save-attachment", cid))
+    Id::unique(("mailcraft-compose-save-attachment", cid))
 }
 
 /// Title of the fallback Save As box.
@@ -366,27 +362,30 @@ pub(super) fn save_as_dialog(ctx: &egui::Context, app: &mut App, cid: u64) {
     };
     let theme = app.theme.clone();
     let mut done: Option<bool> = None;
-    let modal = egui::Modal::new(Id::new(("mailcraft-compose-save-attachment-modal", cid))).show(ctx, |ui| {
-        crate::dialogs::form_visuals(ui, &theme);
-        ui.set_width(460.0);
-        ui.label(egui::RichText::new(SAVE_TITLE).strong().size(14.0));
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let l = ui.label("File name:");
-            ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(360.0)).labelled_by(l.id);
+    let modal =
+        egui::Modal::new(Id::unique(("mailcraft-compose-save-attachment-modal", cid))).show(ctx, |ui| {
+            crate::dialogs::form_visuals(ui, &theme);
+            ui.set_width(460.0);
+            ui.label(egui::RichText::new(SAVE_TITLE).strong().size(14.0));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let l = ui.label("File name:");
+                ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(360.0)).labelled_by(l.id);
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let size = vec2(80.0, 26.0);
+                if ui
+                    .add_enabled(!st.path.trim().is_empty(), egui::Button::new("Save").min_size(size))
+                    .clicked()
+                {
+                    done = Some(true);
+                }
+                if ui.add(egui::Button::new("Cancel").min_size(size)).clicked() {
+                    done = Some(false);
+                }
+            });
         });
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            let size = vec2(80.0, 26.0);
-            if ui.add_enabled(!st.path.trim().is_empty(), egui::Button::new("Save").min_size(size)).clicked()
-            {
-                done = Some(true);
-            }
-            if ui.add(egui::Button::new("Cancel").min_size(size)).clicked() {
-                done = Some(false);
-            }
-        });
-    });
     if done.is_none() && modal.should_close() {
         done = Some(false);
     }

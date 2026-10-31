@@ -8,8 +8,8 @@
 //! `mailcraft_engine::cmd::view::table`; View commands change them.
 
 use egui::{
-    Align, Align2, CornerRadius, FontId, Id, Key, Modifiers, Rect, RichText, ScrollArea, Sense, Stroke,
-    TextEdit, Ui, Vec2, WidgetType, pos2, vec2,
+    Align, Align2, CornerRadius, FontId, Id, Key, Modifiers, Rect, RichText, Role, ScrollArea, Sense, Stroke,
+    TextEdit, Ui, Vec2, pos2, vec2,
 };
 use serde_json::{Value, json};
 
@@ -136,7 +136,7 @@ fn folder_pane(ui: &mut Ui, app: &mut App, view: &ModuleView) {
     let todo = view.view == "To-Do List";
     let (rect, resp) =
         ui.allocate_exact_size(vec2(ui.available_width(), crate::theme::size::FOLDER_ROW), Sense::click());
-    a11y(&resp, WidgetType::Button, "To-Do List");
+    a11y(&resp, Role::Button, "To-Do List");
     if todo {
         ui.painter().rect_filled(rect, CornerRadius::same(4), app.theme.selected_folder);
     } else if resp.hovered() {
@@ -420,7 +420,7 @@ fn row_ui(
     let cell_size = row_font(other, 12.0);
     let base = row_height(app, ROW_H).max((subject_size * 2.0).round());
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), base + extra), Sense::click());
-    a11y(&resp, WidgetType::Button, &row.subject);
+    a11y(&resp, Role::Button, &row.subject);
     let line = Rect::from_min_size(rect.min, vec2(rect.width(), base));
     let sel = app.ui.module_selection == Some(row.id.0);
     if sel {
@@ -447,10 +447,10 @@ fn row_ui(
                 let cb = Rect::from_center_size(cell.center(), Vec2::splat(14.0));
                 let cb_resp = ui.interact(
                     cb.expand(4.0),
-                    Id::new(("mc-task-check", row.id.0, row.group.as_deref())),
+                    Id::unique(("mc-task-check", row.id.0, row.group.as_deref())),
                     Sense::click(),
                 );
-                a11y(&cb_resp, WidgetType::Checkbox, &format!("Complete {}", row.subject));
+                a11y(&cb_resp, Role::CheckBox, &format!("Complete {}", row.subject));
                 draw_check(ui, cb, row.done, app.theme.complete, app.theme.text_muted);
                 toggle |= cb_resp.clicked();
             }
@@ -525,9 +525,12 @@ fn row_ui(
     if !body.is_empty() {
         let x = subject_x.unwrap_or(line.min.x + 52.0);
         let area = Rect::from_min_max(pos2(x, line.max.y - 2.0), rect.max);
-        let pr =
-            ui.interact(area, Id::new(("mc-task-preview", row.id.0, row.group.as_deref())), Sense::hover());
-        a11y(&pr, WidgetType::Label, &body);
+        let pr = ui.interact(
+            area,
+            Id::unique(("mc-task-preview", row.id.0, row.group.as_deref())),
+            Sense::hover(),
+        );
+        a11y(&pr, Role::Label, &body);
         let galley = ui.painter().layout(
             body,
             FontId::proportional(11.5),

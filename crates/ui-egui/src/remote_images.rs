@@ -190,7 +190,7 @@ mod native {
     struct Loader(Arc<Mutex<Shared>>);
 
     fn loader(ctx: &egui::Context) -> Arc<Mutex<Shared>> {
-        let id = egui::Id::new("mailcraft.remote-images");
+        let id = egui::Id::unique("mailcraft.remote-images");
         ctx.data_mut(|d| Arc::clone(&d.get_temp_mut_or_default::<Loader>(id).0))
     }
 

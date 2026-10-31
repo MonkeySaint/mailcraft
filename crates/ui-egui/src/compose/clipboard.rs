@@ -166,7 +166,7 @@ pub fn watching(app: &crate::App) -> bool {
 /// [`watching`]. When the other program clears the clipboard, the copy it had put there leaves the history
 /// again.
 pub fn clipboard_watch(ctx: &egui::Context, app: &mut crate::App) {
-    let id = egui::Id::new("mailcraft-clipboard-watch");
+    let id = egui::Id::unique("mailcraft-clipboard-watch");
     if !watching(app) {
         // Start afresh next time: what was copied meanwhile is not collected when the pane opens.
         ctx.data_mut(|d| d.remove_temp::<Watch>(id));

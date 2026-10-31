@@ -5,7 +5,7 @@
 //! The columns, their order, the sort field and the rules come from the engine
 //! (`mailcraft_engine::cmd::view::table`).
 
-use egui::{Color32, CornerRadius, FontId, Id, Rect, Sense, Stroke, Ui, Vec2, WidgetType, pos2, vec2};
+use egui::{Color32, CornerRadius, FontId, Id, Rect, Role, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use serde_json::json;
 
 use mailcraft_engine::cmd::view::table::{ModuleRowStyle, ShownColumn, SortField, TableColumn};
@@ -110,14 +110,14 @@ pub(crate) fn header(
     let mut clicked = None;
     for l in laid {
         let cell = Rect::from_min_size(pos2(rect.min.x + l.x, rect.min.y), vec2(l.w.max(1.0), rect.height()));
-        let resp = ui.interact(cell, Id::new((salt, "col", l.col.id)), Sense::click());
+        let resp = ui.interact(cell, Id::unique((salt, "col", l.col.id)), Sense::click());
         let sorted = sort.filter(|f| f.column == l.col.id);
         let state = match sorted {
             Some(f) if f.descending => ", sorted descending",
             Some(_) => ", sorted ascending",
             None => "",
         };
-        a11y(&resp, WidgetType::Button, &format!("{}{state}", l.label));
+        a11y(&resp, Role::Button, &format!("{}{state}", l.label));
         if resp.hovered() {
             ui.painter().rect_filled(cell, CornerRadius::same(2), app.theme.hover);
         }
@@ -195,13 +195,13 @@ pub(crate) fn flag_cell(
     label: &str,
 ) -> bool {
     let target = Rect::from_center_size(cell.center(), vec2(cell.width().min(26.0), cell.height().min(24.0)));
-    let resp = ui.interact(target, Id::new(("mc-table-flag", salt.0, salt.1)), Sense::click());
+    let resp = ui.interact(target, Id::unique(("mc-table-flag", salt.0, salt.1)), Sense::click());
     let tip = match look {
         FlagLook::None => "Flag (Quick Click)",
         FlagLook::Flagged => "Mark complete",
         FlagLook::Complete => "Clear flag",
     };
-    a11y(&resp, WidgetType::Button, label);
+    a11y(&resp, Role::Button, label);
     let icon = Rect::from_center_size(cell.center(), Vec2::splat(14.0));
     match look {
         FlagLook::Flagged => app.icons.paint(ui, icon, "flag", app.theme.flag),
@@ -231,9 +231,12 @@ pub(crate) fn categories_cell(
     hovered: bool,
     salt: (&str, u64),
 ) -> bool {
-    let resp =
-        ui.interact(cell.shrink2(vec2(1.0, 2.0)), Id::new(("mc-table-cats", salt.0, salt.1)), Sense::click());
-    a11y(&resp, WidgetType::Button, if cats.is_empty() { "No Categories" } else { "Categories" });
+    let resp = ui.interact(
+        cell.shrink2(vec2(1.0, 2.0)),
+        Id::unique(("mc-table-cats", salt.0, salt.1)),
+        Sense::click(),
+    );
+    a11y(&resp, Role::Button, if cats.is_empty() { "No Categories" } else { "Categories" });
     let mut x = cell.min.x + 4.0;
     for name in cats.iter().take(3) {
         let color = mailcraft_model::Category::find(&app.s.mailbox.categories, name)

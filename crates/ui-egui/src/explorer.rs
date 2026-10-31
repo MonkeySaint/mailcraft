@@ -141,7 +141,6 @@ pub fn explorer_windows(ctx: &egui::Context, app: &mut App) {
 mod tests {
     use super::*;
     use egui::Vec2;
-    use egui_kittest::Harness;
     use mailcraft_engine::sample::sample_session;
 
     #[test]
@@ -182,7 +181,7 @@ mod tests {
         let acct = s.mailbox.folder_account(inbox).unwrap();
         let sent = s.mailbox.role_folder(acct, mailcraft_model::FolderRole::SentItems).unwrap();
         s.run("folder.openInNewWindow", &json!({"folder": sent.0})).unwrap();
-        let mut h = Harness::builder().with_size(Vec2::new(1400.0, 900.0)).build_ui_state(
+        let mut h = crate::test_harness().with_size(Vec2::new(1400.0, 900.0)).build_ui_state(
             |ui, app: &mut App| {
                 ui.ctx().set_embed_viewports(true);
                 app.ui_root(ui);

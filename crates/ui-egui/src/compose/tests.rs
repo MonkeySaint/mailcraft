@@ -18,13 +18,13 @@ fn app_with_compose(inline: bool) -> (App, u64) {
 }
 
 fn window_harness(app: App) -> Harness<'static, App> {
-    Harness::builder()
+    crate::test_harness()
         .with_size([1600.0, 1000.0])
         .build_ui_state(|ui, app: &mut App| compose_windows(ui.ctx(), app), app)
 }
 
 fn inline_harness(app: App, cid: u64) -> Harness<'static, App> {
-    Harness::builder().with_size([900.0, 700.0]).build_ui_state(
+    crate::test_harness().with_size([900.0, 700.0]).build_ui_state(
         move |ui, app: &mut App| {
             inline_compose(ui, app, cid);
         },
@@ -307,7 +307,7 @@ fn people_app() -> (App, u64) {
 
 /// Compose windows plus the dialogs area (Check Names, Signatures and Stationery).
 fn full_harness(app: App) -> Harness<'static, App> {
-    Harness::builder().with_size([1600.0, 1000.0]).build_ui_state(
+    crate::test_harness().with_size([1600.0, 1000.0]).build_ui_state(
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             compose_windows(&ctx, app);
@@ -931,7 +931,7 @@ fn voting_app() -> (App, ItemId) {
 #[test]
 fn reading_pane_tracking_bars_offer_votes_and_the_read_receipt() {
     let (app, id) = voting_app();
-    let mut h = Harness::builder()
+    let mut h = crate::test_harness()
         .with_size([900.0, 300.0])
         .build_ui_state(move |ui, app: &mut App| tracking_bars(ui, app, id, ReceiptPolicy::Ask), app);
     h.run();
@@ -1127,7 +1127,7 @@ fn clipboard_watch_collects_copies_from_other_programs() {
     SYSTEM_CLIP.with(|c| *c.borrow_mut() = "copied before start".into());
     let (mut app, cid) = app_with_compose(false);
     app.run("format.clipboardPane", json!({"compose": cid})).unwrap();
-    let mut h = Harness::builder().with_size([1600.0, 1000.0]).build_ui_state(
+    let mut h = crate::test_harness().with_size([1600.0, 1000.0]).build_ui_state(
         |ui, app: &mut App| {
             clipboard_watch(ui.ctx(), app);
             compose_windows(ui.ctx(), app);
@@ -1167,7 +1167,7 @@ fn clipboard_watch_reads_nothing_while_the_pane_is_closed_and_skips_secrets() {
     set_clipboard_hooks(ClipboardHooks { read_text: Some(counted_clip), ..Default::default() });
     SYSTEM_CLIP.with(|c| *c.borrow_mut() = "at start".into());
     let (app, cid) = app_with_compose(false);
-    let mut h = Harness::builder().with_size([1600.0, 1000.0]).build_ui_state(
+    let mut h = crate::test_harness().with_size([1600.0, 1000.0]).build_ui_state(
         |ui, app: &mut App| {
             clipboard_watch(ui.ctx(), app);
             compose_windows(ui.ctx(), app);
@@ -1460,7 +1460,7 @@ fn auto_save_timer_ticks_while_a_compose_has_changes() {
     // The window draws the timer every frame.
     let mut h = window_harness(app);
     h.run();
-    assert!(h.ctx.data(|d| d.get_temp::<f64>(egui::Id::new("mailcraft-compose-autosave"))).is_some());
+    assert!(h.ctx.data(|d| d.get_temp::<f64>(egui::Id::unique("mailcraft-compose-autosave"))).is_some());
 }
 
 #[test]
@@ -1501,7 +1501,7 @@ fn paste_defaults_follow_where_the_text_was_copied() {
 #[test]
 fn f6_cycles_header_fields_body_and_ribbon_in_a_compose_window() {
     let (app, cid) = app_with_compose(false);
-    let mut h = Harness::builder().with_size([1600.0, 1000.0]).build_ui_state(
+    let mut h = crate::test_harness().with_size([1600.0, 1000.0]).build_ui_state(
         |ui, app: &mut App| {
             crate::keys::handle(ui.ctx(), app, crate::Surface::Main);
             compose_windows(ui.ctx(), app);
@@ -2197,7 +2197,7 @@ fn more_colors_picks_from_the_standard_grid() {
 fn compose_window_covers_a_small_screen() {
     let (app, cid) = app_with_compose(false);
     let title = app.s.composes.get(&cid).map(ComposeState::title).unwrap_or_default();
-    let mut h = Harness::builder()
+    let mut h = crate::test_harness()
         .with_size([1024.0, 768.0])
         .build_ui_state(|ui, app: &mut App| compose_windows(ui.ctx(), app), app);
     h.run();
@@ -2217,7 +2217,7 @@ fn compose_window_covers_a_small_screen() {
 #[test]
 fn reminders_stay_reachable_over_a_full_screen_compose() {
     let (app, cid) = app_with_compose(false);
-    let mut h = Harness::builder().with_size([1024.0, 768.0]).build_ui_state(
+    let mut h = crate::test_harness().with_size([1024.0, 768.0]).build_ui_state(
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             compose_windows(&ctx, app);
@@ -2231,7 +2231,7 @@ fn reminders_stay_reachable_over_a_full_screen_compose() {
     let ctx = h.ctx.clone();
     crate::modules::open_reminders(&ctx, h.state());
     h.run_steps(2);
-    let reminders = egui::LayerId::new(egui::Order::Middle, egui::Id::new("mc-reminders-window"));
+    let reminders = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("mc-reminders-window"));
     let title = h.get_by_label_contains("Reminders").rect().center();
     assert_eq!(h.ctx.layer_id_at(title), Some(reminders));
     // A click in the compose, outside the Reminders window.

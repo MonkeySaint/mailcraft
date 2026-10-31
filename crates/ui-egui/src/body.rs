@@ -361,7 +361,7 @@ fn paint_and_interact(
             }
             text.truncate(cut);
         }
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text)
+        egui::WidgetInfo::labeled(egui::Role::Label, true, text)
     });
 
     // --- painting ----------------------------------------------------------------------------------
@@ -1257,7 +1257,7 @@ impl ImageCache {
 }
 
 fn image_cache_id() -> Id {
-    Id::new("mailcraft-body-images")
+    Id::unique("mailcraft-body-images")
 }
 
 fn load_picture(ctx: &egui::Context, key: u64, data: &[u8]) -> Option<egui::TextureHandle> {
@@ -1390,7 +1390,7 @@ struct ImageSizes {
 }
 
 fn image_sizes_id() -> Id {
-    Id::new("mailcraft-body-image-sizes")
+    Id::unique("mailcraft-body-image-sizes")
 }
 
 /// Records the intrinsic size of the remote picture at `url` (a [`crate::remote_images::key`]).
@@ -1565,7 +1565,7 @@ fn paint_texture(painter: &egui::Painter, r: Rect, tex: &egui::TextureHandle) {
 /// The font database for message bodies (bundled faces plus the installed fonts once the platform shell has
 /// indexed them, see [`FontDb::with_installed`]), shared through egui's temp data (built once per context).
 pub fn font_db(ctx: &egui::Context) -> Arc<FontDb> {
-    let id = Id::new("mailcraft.body.fontdb");
+    let id = Id::unique("mailcraft.body.fontdb");
     if let Some(db) = ctx.data(|d| d.get_temp::<Arc<FontDb>>(id)) {
         return db;
     }
@@ -1602,7 +1602,7 @@ pub fn preview_family(ctx: &egui::Context, name: &str) -> Option<FontFamily> {
     if key.is_empty() {
         return None;
     }
-    let id = Id::new("mailcraft.body.font-previews");
+    let id = Id::unique("mailcraft.body.font-previews");
     let frame = ctx.cumulative_pass_nr();
     let mut st = ctx.data(|d| d.get_temp::<Arc<Previews>>(id)).map(|a| (*a).clone()).unwrap_or_default();
     if !st.names.contains(&key) {
@@ -1676,11 +1676,8 @@ fn egui_family(ctx: &egui::Context, db: &FontDb, id: McFontId) -> FontFamily {
                 .map(|names| {
                     names
                         .iter()
-                        .filter_map(|n| {
-                            let d = defs.font_data.get(n)?;
-                            matches!(d.font, std::borrow::Cow::Borrowed(_))
-                                .then(|| (n.clone(), Arc::clone(d)))
-                        })
+                        // The font bytes are shared (`Blob`), so copying an entry does not copy the file.
+                        .filter_map(|n| defs.font_data.get(n).map(|d| (n.clone(), Arc::clone(d))))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -1691,7 +1688,7 @@ fn egui_family(ctx: &egui::Context, db: &FontDb, id: McFontId) -> FontFamily {
         return family;
     }
     // Register once per context (the insert is applied at the start of the next pass).
-    let flag = Id::new(("mailcraft.body.font-requested", name.as_str()));
+    let flag = Id::unique(("mailcraft.body.font-requested", name.as_str()));
     let requested = ctx.data(|d| d.get_temp::<bool>(flag)).unwrap_or(false);
     if !requested {
         ctx.data_mut(|d| d.insert_temp(flag, true));

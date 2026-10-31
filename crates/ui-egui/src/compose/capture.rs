@@ -154,7 +154,7 @@ type Jobs = Arc<Mutex<Vec<Job>>>;
 /// own).
 fn jobs(ctx: &egui::Context) -> Jobs {
     ctx.data_mut(|d| {
-        d.get_temp_mut_or_insert_with(egui::Id::new("mailcraft-capture-jobs"), Jobs::default).clone()
+        d.get_temp_mut_or_insert_with(egui::Id::unique("mailcraft-capture-jobs"), Jobs::default).clone()
     })
 }
 /// Whole-screen captures waiting in the Screen Clipping dialog, by token.

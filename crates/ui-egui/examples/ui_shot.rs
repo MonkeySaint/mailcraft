@@ -150,6 +150,8 @@ fn shoot(o: &Opts) -> Result<(), String> {
     }
     let mut fonts_done = false;
     let mut harness = Harness::builder()
+        .with_accessibility_check(false)
+        .allow_missing_glyphs()
         .with_size(egui::vec2(o.w, o.h))
         .with_pixels_per_point(o.scale)
         .wgpu()

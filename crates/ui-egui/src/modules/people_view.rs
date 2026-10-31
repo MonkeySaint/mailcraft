@@ -7,8 +7,8 @@
 //! `mailcraft_engine::cmd::view::table`.
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Modifiers, Rect, RichText, ScrollArea,
-    Sense, Stroke, TextEdit, Ui, Vec2, WidgetType, pos2, vec2,
+    Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Modifiers, Rect, RichText, Role,
+    ScrollArea, Sense, Stroke, TextEdit, Ui, Vec2, pos2, vec2,
 };
 use serde_json::json;
 
@@ -206,7 +206,7 @@ fn content(
                 editors::new_contact(app, st, f, false);
             }
             let group = crate::widgets::icon_only(ui, app, "contact-group", "New Contact Group", true);
-            a11y(&group, WidgetType::Button, "New Contact Group");
+            a11y(&group, Role::Button, "New Contact Group");
             if group.clicked() {
                 let f = current_folder(app, Kind::Contact);
                 editors::new_contact(app, st, f, true);
@@ -322,7 +322,7 @@ fn table_view(ui: &mut Ui, app: &mut App, st: &mut ModState, folder: Option<Fold
                 ui.allocate_exact_size(vec2(ui.available_width(), row_h + extra), Sense::click());
             let rect = Rect::from_min_size(full.min, vec2(full.width(), row_h));
             let name = display_name(&c);
-            a11y(&resp, WidgetType::Button, &name);
+            a11y(&resp, Role::Button, &name);
             if app.ui.module_selection == Some(r.id.0) {
                 ui.painter().rect_filled(full, CornerRadius::same(3), app.theme.selected);
             } else if resp.hovered() {
@@ -422,7 +422,7 @@ fn table_view(ui: &mut Ui, app: &mut App, st: &mut ModState, folder: Option<Fold
 
 /// egui memory: the additional index is the one shown (People › "Show an additional index").
 fn alt_index_id() -> Id {
-    Id::new("mc-people-index-alt")
+    Id::unique("mc-people-index-alt")
 }
 
 /// Accessible names of the index switch.
@@ -457,8 +457,8 @@ fn letter_index(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids: 
     for (k, &c) in INDEX.iter().enumerate() {
         let r = Rect::from_min_size(pos2(rect.min.x, rect.min.y + 4.0 + h * k as f32), vec2(INDEX_W, h));
         let label = if c == '#' { "123".to_owned() } else { c.to_string() };
-        let resp = ui.interact(r, Id::new(("mc-people-index", c)), Sense::click());
-        a11y(&resp, WidgetType::Button, &format!("Jump to {label}"));
+        let resp = ui.interact(r, Id::unique(("mc-people-index", c)), Sense::click());
+        a11y(&resp, Role::Button, &format!("Jump to {label}"));
         if resp.hovered() {
             ui.painter().rect_filled(r, CornerRadius::same(3), app.theme.hover);
         }
@@ -473,8 +473,8 @@ fn letter_index(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, ids: 
 
 /// The switch button below the index letters.
 fn index_switch(ui: &mut Ui, app: &App, r: Rect, label: &str, name: &str, to_alt: bool) {
-    let resp = ui.interact(r, Id::new(("mc-people-index-switch", to_alt)), Sense::click());
-    a11y(&resp, WidgetType::Button, name);
+    let resp = ui.interact(r, Id::unique(("mc-people-index-switch", to_alt)), Sense::click());
+    a11y(&resp, Role::Button, name);
     let fill = if resp.hovered() { app.theme.hover } else { app.theme.group_header };
     ui.painter().rect_filled(r.shrink(2.0), CornerRadius::same(3), fill);
     ui.painter().text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(10.5), app.theme.accent);
@@ -503,8 +503,8 @@ fn alt_letter_index(
     let h = ((rect.height() - 8.0) / (letters.len() + 1) as f32).clamp(8.0, 23.0);
     for (k, &c) in letters.iter().enumerate() {
         let r = Rect::from_min_size(pos2(rect.min.x, rect.min.y + 4.0 + h * k as f32), vec2(INDEX_W, h));
-        let resp = ui.interact(r, Id::new(("mc-people-index-alt", k)), Sense::click());
-        a11y(&resp, WidgetType::Button, &format!("Jump to {c}"));
+        let resp = ui.interact(r, Id::unique(("mc-people-index-alt", k)), Sense::click());
+        a11y(&resp, Role::Button, &format!("Jump to {c}"));
         if resp.hovered() {
             ui.painter().rect_filled(r, CornerRadius::same(3), app.theme.hover);
         }
@@ -608,7 +608,7 @@ fn contact_list(ui: &mut Ui, app: &mut App, st: &mut ModState, ids: &[ItemId]) {
             let (rect, resp) =
                 ui.allocate_exact_size(vec2(ui.available_width(), row_height(app, ROW_H)), Sense::click());
             let name = display_name(&c);
-            a11y(&resp, WidgetType::Button, &name);
+            a11y(&resp, Role::Button, &name);
             let sel = app.ui.module_selection == Some(id.0);
             if sel {
                 ui.painter().rect_filled(
@@ -644,8 +644,8 @@ fn contact_list(ui: &mut Ui, app: &mut App, st: &mut ModState, ids: &[ItemId]) {
             if c.private {
                 let r =
                     Rect::from_min_size(pos2(rect.max.x - 46.0, rect.center().y - 7.0), Vec2::splat(14.0));
-                let lock = ui.interact(r, Id::new(("mc-people-private", id.0)), Sense::hover());
-                a11y(&lock, WidgetType::Label, &format!("Private {name}"));
+                let lock = ui.interact(r, Id::unique(("mc-people-private", id.0)), Sense::hover());
+                a11y(&lock, Role::Label, &format!("Private {name}"));
                 app.icons.paint(ui, r, "private", app.theme.text_muted);
             }
             paint_text_clipped(
@@ -900,9 +900,9 @@ fn cards(
                     pos2(area.min.x + col as f32 * (card_w + 10.0), area.min.y + r as f32 * (card_h + 10.0)),
                     vec2(card_w, card_h),
                 );
-                let resp = ui.interact(card, Id::new(("mc-people-cardbox", id.0)), Sense::click());
+                let resp = ui.interact(card, Id::unique(("mc-people-cardbox", id.0)), Sense::click());
                 let name = display_name(&c);
-                a11y(&resp, WidgetType::Button, &name);
+                a11y(&resp, Role::Button, &name);
                 let sel = app.ui.module_selection == Some(id.0);
                 let p = ui.painter();
                 p.rect_filled(card, CornerRadius::same(4), app.theme.pane);
@@ -1013,9 +1013,9 @@ fn business_cards(
                         ),
                         vec2(card_w, card_h),
                     );
-                    let resp = ui.interact(card, Id::new(("mc-people-bcard", id.0)), Sense::click());
+                    let resp = ui.interact(card, Id::unique(("mc-people-bcard", id.0)), Sense::click());
                     let name = display_name(&c);
-                    a11y(&resp, WidgetType::Button, &format!("Business card {name}"));
+                    a11y(&resp, Role::Button, &format!("Business card {name}"));
                     let sel = app.ui.module_selection == Some(id.0);
                     let p = ui.painter();
                     p.rect_filled(card.translate(vec2(2.0, 2.0)), CornerRadius::same(6), app.theme.separator);

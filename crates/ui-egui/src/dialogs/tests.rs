@@ -10,7 +10,7 @@ use mailcraft_engine::sample::sample_session;
 use mailcraft_model::{FlagState, FolderId, ItemId, RuleAction, RuleCondition};
 
 fn harness(app: App) -> Harness<'static, App> {
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
+    let mut h = crate::test_harness().with_size(egui::vec2(1280.0, 900.0)).build_ui_state(
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             crate::backstage::backstage(&ctx, app);
@@ -1409,7 +1409,7 @@ fn view_in_browser_opens_the_written_page() {
 }
 
 fn sized(app: App, w: f32, ht: f32) -> Harness<'static, App> {
-    let mut h = Harness::builder().with_size(egui::vec2(w, ht)).build_ui_state(
+    let mut h = crate::test_harness().with_size(egui::vec2(w, ht)).build_ui_state(
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             crate::dialogs::dialogs(&ctx, app);
@@ -1529,7 +1529,7 @@ fn advanced_find_buttons_share_a_width_and_line_up_with_the_form() {
 fn backstage_at(w: f32, ht: f32) -> Harness<'static, App> {
     let mut app = sample_app();
     app.ui.backstage = Some((Surface::Main, "info".into()));
-    let mut h = Harness::builder().with_size(egui::vec2(w, ht)).build_ui_state(
+    let mut h = crate::test_harness().with_size(egui::vec2(w, ht)).build_ui_state(
         |ui, app: &mut App| {
             let ctx = ui.ctx().clone();
             crate::backstage::backstage(&ctx, app);

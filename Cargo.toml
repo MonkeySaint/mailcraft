@@ -6,7 +6,7 @@ members = ["crates/*", "apps/*", "xtask"]
 version = "0.5.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.90"
+rust-version = "1.95"
 description = "A clean-room, open-source desktop mail client modelled on the classic Outlook workflow"
 
 [workspace.dependencies]
@@ -47,10 +47,12 @@ unicode-linebreak = "0.1"
 unicode-width = "0.2"
 
 # ui
-egui = "0.36"
-egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "accesskit", "links"] }
-egui_kittest = "0.36"
+# egui 0.37 left its emoji fonts (NotoEmoji, emoji-icon-font) out of the default fonts; they stay as fallbacks.
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
+# `clipboard` (the system clipboard in egui-winit) became optional in eframe 0.37; it was always on before.
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "accesskit", "links", "clipboard"] }
+egui_kittest = "0.37"
 # Raster decoding (MIT OR Apache-2.0): PNG, JPEG (zune-jpeg) and GIF only, for contact pictures, pasted and
 # inline pictures, and screenshots in tests.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }

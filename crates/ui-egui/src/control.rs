@@ -52,6 +52,9 @@ struct Inner {
     /// The egui context, shared with the connection threads so they can wake the UI.
     ctx: Arc<Mutex<Option<egui::Context>>>,
     screenshots: Vec<ScreenshotJob>,
+    /// Screenshots the integration has read back (sent from the screenshot callback).
+    shots_tx: Sender<Arc<egui::ColorImage>>,
+    shots_rx: Receiver<Arc<egui::ColorImage>>,
 }
 
 impl std::fmt::Debug for Inner {
@@ -95,7 +98,10 @@ impl Control {
             return None;
         }
         log::info!("control channel listening on {addr}");
-        Some(Control { inner: Some(Inner { rx, addr, stop, ctx, screenshots: Vec::new() }) })
+        let (shots_tx, shots_rx) = mpsc::channel();
+        Some(Control {
+            inner: Some(Inner { rx, addr, stop, ctx, screenshots: Vec::new(), shots_tx, shots_rx }),
+        })
     }
 
     /// Starts on the port in `MAILCRAFT_CONTROL_PORT`, if set and valid.
@@ -123,7 +129,11 @@ impl Control {
             let id = p.request.get("id").cloned().unwrap_or(Value::Null);
             if p.request.get("cmd").and_then(Value::as_str) == Some("screenshot") {
                 let path = p.request.get("path").and_then(Value::as_str).map(PathBuf::from);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                let (tx, wake) = (inner.shots_tx.clone(), ctx.clone());
+                ctx.request_screenshot(move |image| {
+                    let _ = tx.send(image);
+                    wake.request_repaint();
+                });
                 ctx.request_repaint();
                 inner.screenshots.push(ScreenshotJob { id, path, reply: p.reply });
                 continue;
@@ -142,7 +152,7 @@ impl Control {
 /// failed bind is not retried) and answers queued requests. Call once per frame on the main window's context.
 pub fn frame(ctx: &egui::Context, app: &mut App) {
     let Some(port) = app.ui.control_port else { return };
-    let id = egui::Id::new("mailcraft.control");
+    let id = egui::Id::unique("mailcraft.control");
     let slot = ctx.data_mut(|d| d.get_temp::<SharedControl>(id));
     let slot = match slot {
         Some(s) => s,
@@ -428,15 +438,11 @@ fn query(app: &App, what: &str, req: &Value) -> Result<Value, String> {
 // Screenshots
 
 fn deliver_screenshots(ctx: &egui::Context, inner: &mut Inner) {
+    // Drain every time, so a late picture for requests already answered is not handed to the next one.
+    let image = inner.shots_rx.try_iter().last();
     if inner.screenshots.is_empty() {
         return;
     }
-    let image = ctx.input(|i| {
-        i.raw.events.iter().find_map(|e| match e {
-            egui::Event::Screenshot { image, .. } => Some(Arc::clone(image)),
-            _ => None,
-        })
-    });
     let Some(image) = image else {
         ctx.request_repaint();
         return;

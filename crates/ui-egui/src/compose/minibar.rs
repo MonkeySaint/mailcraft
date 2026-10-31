@@ -45,7 +45,7 @@ struct Bar {
 }
 
 fn id(cid: u64) -> Id {
-    Id::new(("mailcraft-compose-minibar", cid))
+    Id::unique(("mailcraft-compose-minibar", cid))
 }
 
 fn load(ctx: &egui::Context, cid: u64) -> Bar {
@@ -127,13 +127,13 @@ pub(super) fn show(ctx: &egui::Context, host: &mut dyn EditorHost, cid: u64) {
     egui::Area::new(id(cid).with("area")).order(Order::Foreground).fixed_pos(min).show(ctx, |ui| {
         let (frame, _) = ui.allocate_exact_size(size, Sense::hover());
         let group = ui.interact(frame, id(cid).with("group"), Sense::hover());
-        group.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, LABEL));
+        group.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Unknown, true, LABEL));
         ui.painter().rect_filled(frame, CornerRadius::same(4), fill);
         ui.painter().rect_stroke(frame, CornerRadius::same(4), Stroke::new(1.0, stroke), StrokeKind::Inside);
         for (i, (icon, label, cmd)) in BUTTONS.iter().enumerate() {
             let r = Rect::from_min_size(frame.min + vec2(4.0 + BTN * i as f32, 4.0), Vec2::splat(BTN));
             let resp = ui.interact(r, id(cid).with(("btn", i)), Sense::click());
-            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, *label));
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, *label));
             if resp.hovered() {
                 ui.painter().rect_filled(r, CornerRadius::same(3), hover);
             }

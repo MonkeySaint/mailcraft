@@ -217,7 +217,7 @@ struct Ac {
 }
 
 fn ac_id(cid: u64, f: Field) -> Id {
-    Id::new(("mailcraft-compose-autocomplete", cid, f))
+    Id::unique(("mailcraft-compose-autocomplete", cid, f))
 }
 
 /// Options › Mail › "Use Auto-Complete List to suggest names" (engine setting `mail.autoComplete`).
@@ -317,7 +317,7 @@ pub(super) fn address_field(
         .id(fid)
         .frame(egui::Frame::NONE)
         .text_color(color)
-        .vertical_align(egui::Align::Center)
+        .align(egui::Align2::LEFT_CENTER)
         .desired_width(edit_rect.width());
     let mut r = ui.put(edit_rect, te);
     if let Some(l) = label_id {
@@ -361,7 +361,7 @@ pub(super) fn address_field(
             let pos = pos2(rect.left(), rect.bottom() + 1.0);
             let width = rect.width().clamp(240.0, 460.0);
             let theme = app.theme.clone();
-            egui::Area::new(Id::new(("mailcraft-compose-autocomplete-list", cid, f)))
+            egui::Area::new(Id::unique(("mailcraft-compose-autocomplete-list", cid, f)))
                 .order(egui::Order::Foreground)
                 .fixed_pos(pos)
                 .show(&ctx, |ui| {
@@ -456,11 +456,11 @@ fn paint_pills(ui: &mut Ui, app: &App, cid: u64, f: Field, rect: Rect, shown: &[
             };
             let hover = ui.interact(
                 pill.intersect(rect),
-                Id::new(("mailcraft-recipient", cid, f, i)),
+                Id::unique(("mailcraft-recipient", cid, f, i)),
                 Sense::hover(),
             );
             let label = e.label.clone();
-            hover.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &label));
+            hover.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &label));
             hover.on_hover_text(full);
             x = pill.right() + 6.0;
         } else {
@@ -573,7 +573,7 @@ mod tests {
         use egui::accesskit::Role;
         use egui_kittest::kittest::Queryable;
         let (app, cid) = compose_app(commas);
-        let mut h = egui_kittest::Harness::builder().with_size([900.0, 700.0]).build_ui_state(
+        let mut h = crate::test_harness().with_size([900.0, 700.0]).build_ui_state(
             move |ui, app: &mut crate::App| {
                 super::super::inline_compose(ui, app, cid);
             },

@@ -57,7 +57,7 @@ struct Alerts {
 }
 
 fn list_id() -> Id {
-    Id::new("mc-new-item-alerts")
+    Id::unique("mc-new-item-alerts")
 }
 
 /// The `_dlg` uid of the first open New Item Alert window.
@@ -72,7 +72,7 @@ fn primary_uid(app: &App) -> Option<u64> {
 fn new_item_alerts(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
     let uid = d.uid;
     // Each opened window hands its lines to the shared list once.
-    let merged = Id::new(("mc-new-item-alerts-merged", uid));
+    let merged = Id::unique(("mc-new-item-alerts-merged", uid));
     if !ctx.data_mut(|m| m.get_temp::<bool>(merged)).unwrap_or(false) {
         ctx.data_mut(|m| m.insert_temp(merged, true));
         let mut list = ctx.data_mut(|m| m.get_temp::<Alerts>(list_id())).unwrap_or_default();
@@ -166,7 +166,7 @@ fn new_item_alerts(ctx: &Context, app: &mut App, d: &Dlg<'_>) -> Out {
 /// Sound files the rules asked to play this session (newest last).
 #[cfg(test)]
 pub(crate) fn played_sounds(ctx: &Context) -> Vec<String> {
-    ctx.data_mut(|m| m.get_temp::<Vec<String>>(Id::new("mc-rule-sounds"))).unwrap_or_default()
+    ctx.data_mut(|m| m.get_temp::<Vec<String>>(Id::unique("mc-rule-sounds"))).unwrap_or_default()
 }
 
 /// Plays a sound file. MailCraft has no audio back end yet, so this does nothing (the request is recorded
@@ -181,7 +181,7 @@ fn play_sound(_path: &str) {}
 
 fn rule_sound(ctx: &Context, d: &Dlg<'_>) -> Out {
     let paths: Vec<String> = d.arr("paths").iter().filter_map(Value::as_str).map(str::to_owned).collect();
-    let id = Id::new("mc-rule-sounds");
+    let id = Id::unique("mc-rule-sounds");
     let mut played = ctx.data_mut(|m| m.get_temp::<Vec<String>>(id)).unwrap_or_default();
     for p in paths {
         play_sound(&p);

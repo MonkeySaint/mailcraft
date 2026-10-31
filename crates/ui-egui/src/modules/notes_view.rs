@@ -9,8 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Modifiers, Rect, ScrollArea, Sense,
-    Stroke, TextEdit, Ui, Vec2, WidgetType, pos2, vec2,
+    Align, Align2, Color32, CornerRadius, FontId, Id, Key, Layout, Modifiers, Rect, Role, ScrollArea, Sense,
+    Stroke, TextEdit, Ui, Vec2, pos2, vec2,
 };
 use serde_json::{Value, json};
 
@@ -220,7 +220,7 @@ fn content(
     }
     let (list_rect, pane) = reading_split(body, view.reading_pane, (body.width() * 0.6).max(360.0), 0.6);
     // Clicking the background ends editing.
-    let bg = ui.interact(list_rect, Id::new("mc-notes-bg"), Sense::click());
+    let bg = ui.interact(list_rect, Id::unique("mc-notes-bg"), Sense::click());
     if bg.clicked() {
         commit_edit(app, st);
         select_item(app, None);
@@ -358,13 +358,13 @@ fn edit_box(ui: &mut Ui, app: &mut App, st: &mut ModState, rect: Rect, id: ItemI
     let resp = ui.put(
         rect,
         TextEdit::multiline(text)
-            .id(Id::new(("mc-note-edit", id.0)))
+            .id(Id::unique(("mc-note-edit", id.0)))
             .frame(egui::Frame::NONE)
             .text_color(app.theme.text)
             .desired_width(rect.width())
             .hint_text("Type your note"),
     );
-    a11y(&resp, WidgetType::TextEdit, "Note text");
+    a11y(&resp, Role::TextInput, "Note text");
     if st.note_focus {
         resp.request_focus();
         st.note_focus = false;
@@ -470,9 +470,9 @@ fn grid(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId], view: &
         let card = Rect::from_min_size(area.min + off, vec2(w, h));
         let editing = st.note_edit.as_ref().is_some_and(|(e, _)| *e == id.0);
         let sense = if editing { Sense::click() } else { Sense::click_and_drag() };
-        let resp = ui.interact(card, Id::new(("mc-note", id.0)), sense);
+        let resp = ui.interact(card, Id::unique(("mc-note", id.0)), sense);
         let t = title(&n);
-        a11y(&resp, WidgetType::Button, if t.is_empty() { "(Empty note)" } else { &t });
+        a11y(&resp, Role::Button, if t.is_empty() { "(Empty note)" } else { &t });
         paint_note(ui, app, card, &n, app.ui.module_selection == Some(id.0), small, editing);
         if editing {
             edit_box(ui, app, st, card.shrink2(vec2(8.0, 12.0)), id);
@@ -591,10 +591,10 @@ fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, view: &ModuleView, rows:
     ui.painter().rect_filled(head, CornerRadius::ZERO, blend(app.theme.reading, app.theme.backdrop, 0.3));
     for (key, x, w) in &cols {
         let r = Rect::from_min_size(pos2(head.min.x + x, head.min.y), vec2(*w, head.height()));
-        let resp = ui.interact(r, Id::new(("mc-notes-head", *key)), Sense::click());
+        let resp = ui.interact(r, Id::unique(("mc-notes-head", *key)), Sense::click());
         // Format Columns may rename a column.
         let label = shown.iter().find(|(k, ..)| k == key).map_or("", |(_, l, _)| l.as_str());
-        a11y(&resp, WidgetType::Button, &format!("Sort by {label}"));
+        a11y(&resp, Role::Button, &format!("Sort by {label}"));
         if resp.hovered() {
             ui.painter().rect_filled(r, CornerRadius::ZERO, app.theme.hover);
         }
@@ -652,7 +652,7 @@ fn table(ui: &mut Ui, app: &mut App, st: &mut ModState, view: &ModuleView, rows:
                 };
                 let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
                 let resp = if first_row { resp } else { resp.on_hover_text("Listed in more than one group") };
-                a11y(&resp, WidgetType::Button, &cell_text(&n, "subject", tz));
+                a11y(&resp, Role::Button, &cell_text(&n, "subject", tz));
                 let sel = app.ui.module_selection == Some(id.0);
                 if sel {
                     ui.painter().rect_filled(row, CornerRadius::ZERO, app.theme.selected);
@@ -760,7 +760,7 @@ fn list(ui: &mut Ui, app: &mut App, st: &mut ModState, order: &[ItemId]) {
         let h = if editing { 120.0 } else { row_height(app, 46.0) };
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
         let t = title(&n);
-        a11y(&resp, WidgetType::Button, if t.is_empty() { "(Empty note)" } else { &t });
+        a11y(&resp, Role::Button, if t.is_empty() { "(Empty note)" } else { &t });
         let sel = app.ui.module_selection == Some(id.0);
         if sel {
             ui.painter().rect_filled(rect, CornerRadius::same(3), app.theme.selected);
