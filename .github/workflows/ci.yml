@@ -18,6 +18,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "4"
+  # No debug info in CI builds: with it the debug `target` folder outgrew the runner's disk (the linker
+  # failed with "No space left on device"). Test failures still report file and line.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   ci:
@@ -48,3 +52,6 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: cargo xtask ci
         run: cargo xtask ci
+      - name: Disk left
+        if: always()
+        run: df -h / "$GITHUB_WORKSPACE"
